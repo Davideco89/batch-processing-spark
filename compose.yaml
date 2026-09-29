@@ -1,0 +1,21 @@
+services:
+  job:
+    user: "${LOCAL_UID:-185}:${LOCAL_GID:-185}"
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+      args:
+        LOCAL_UID: "${LOCAL_UID:-185}"
+        LOCAL_GID: "${LOCAL_GID:-185}"
+    volumes:
+      - ./data:/data
+  test:
+    user: "${LOCAL_UID:-185}:${LOCAL_GID:-185}"
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+      args:
+        LOCAL_UID: "${LOCAL_UID:-185}"
+        LOCAL_GID: "${LOCAL_GID:-185}"
+    entrypoint: ["python3", "-m", "unittest"]
+    command: ["discover", "-s", "tests", "-v"]

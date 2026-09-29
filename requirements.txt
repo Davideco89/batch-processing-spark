@@ -1,0 +1,3 @@
+# Additional package installed into the pinned Spark Docker image.
+# Python, Java, PySpark and Py4J are supplied by that image; no host pip setup.
+duckdb==1.5.6

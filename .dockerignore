@@ -1,0 +1,15 @@
+.git
+data
+output
+**/__pycache__
+.venv
+.env
+.env.*
+.pytest_cache
+.idea
+.vscode
+.codex
+.agents
+AGENTS.md
+spark-warehouse
+metastore_db
