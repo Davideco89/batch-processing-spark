@@ -146,24 +146,30 @@ have not been tested.
 The setup scripts were exercised from Windows PowerShell and Ubuntu WSL Bash
 against Docker Desktop (Bash used a verification-only Windows CLI path bridge
 because distro integration was disabled). Linux filesystem permissions were
-checked separately on an isolated container volume. This is not evidence of
-a native macOS/Linux Docker installation or a remote clone.
+checked separately on an isolated container volume. This does not establish
+native macOS/Linux Docker behavior. A fresh anonymous clone was checked
+separately after publication.
 
-### Getting started from an existing checkout
+### Getting started from a checkout
 
-There is no published repository URL or verified fresh-clone procedure yet.
-Start from the existing project checkout; no remote URL is invented here.
-From its parent directory, Windows PowerShell:
+The public repository is [batch-processing-spark](https://github.com/Davideco89/batch-processing-spark).
+A fresh anonymous clone was verified after publication. From the directory
+where you want the checkout, Windows PowerShell:
 
 ```powershell
+git clone https://github.com/Davideco89/batch-processing-spark.git
 .\batch-processing-spark\scripts\setup.ps1
 ```
 
-From any directory, macOS/Linux Bash (adjust the checkout path):
+From the directory where you want the checkout, macOS/Linux Bash:
 
 ```bash
-bash /path/to/batch-processing-spark/scripts/setup.sh
+git clone https://github.com/Davideco89/batch-processing-spark.git
+bash ./batch-processing-spark/scripts/setup.sh
 ```
+
+The setup checks below were run on local checkouts and a sanitized candidate;
+they were not rerun on the published GitHub clone.
 
 Both scripts locate the repository, validate Compose, build the runtime, probe
 write access to the data bind, run autonomous tests, and verify the essential
@@ -216,8 +222,9 @@ Compose mounts `./data:/data` for the job service. Data survives container exit;
 Container `/tmp` scratch disappears too. Source is copied into images: rebuild
 when code changes. Tests generate data in temporary directories and do not mount
 or require the host data. `.gitignore` and `.dockerignore` exclude generated data,
-caches, environments, secrets, and personal workflow configuration. Earlier
-local commits still contain that configuration; the public history is pending.
+caches, environments, secrets, and personal workflow configuration. Published
+`main` has a single root commit without those personal files; the earlier
+project history remains in local refs only.
 
 ## Run the pipeline
 
@@ -271,7 +278,8 @@ independent, so supply destination overrides when using a separate test dataset.
 Use the same single-line Compose commands above from the project root in Bash.
 No PowerShell-specific syntax is needed in those invocations. Native macOS and
 Linux hosts were **not** tested; Linux container execution on Windows was tested.
-No fresh Git clone, remote repository, CI run, or native-host guarantee is claimed.
+A fresh anonymous Git clone was verified; CI and native-host behavior remain
+untested.
 
 ## Validation and observed results
 
@@ -403,8 +411,8 @@ GH Archive delivery latency, upstream completeness, changes to completed remote
 objects, and activity beyond selected hours have not been established. Bot
 classification is heuristic. The oracle supports the tested JSON contract;
 unsupported malformed shapes fail reconciliation rather than being silently
-certified. No production scheduler, CI, native-host tests, or public-history
-sanitization is claimed. Version-tag image selection can change upstream.
+certified. No production scheduler, CI, or native-host tests are claimed.
+Version-tag image selection can change upstream.
 
 ## Troubleshooting
 
