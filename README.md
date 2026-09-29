@@ -158,8 +158,12 @@ where you want the checkout, Windows PowerShell:
 
 ```powershell
 git clone https://github.com/Davideco89/batch-processing-spark.git
-.\batch-processing-spark\scripts\setup.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\batch-processing-spark\scripts\setup.ps1
 ```
+
+The explicit process-level execution policy lets the setup script run on Windows
+hosts that otherwise block local PowerShell scripts; it does not change the
+machine's persistent policy.
 
 From the directory where you want the checkout, macOS/Linux Bash:
 
@@ -168,8 +172,8 @@ git clone https://github.com/Davideco89/batch-processing-spark.git
 bash ./batch-processing-spark/scripts/setup.sh
 ```
 
-The setup checks below were run on local checkouts and a sanitized candidate;
-they were not rerun on the published GitHub clone.
+The setup checks below were run on local checkouts, a sanitized candidate,
+and the published GitHub clone on Windows PowerShell with Linux Docker containers.
 
 Both scripts locate the repository, validate Compose, build the runtime, probe
 write access to the data bind, run autonomous tests, and verify the essential
@@ -217,12 +221,12 @@ the Docker runtime identity; no credentials are required.
 | CSV | `/data/output/csv/github-events` | `data/output/csv/github-events/` |
 | Verification, logs, temporary experiments | `/data/test` | `data/test/` |
 
-Compose mounts `./data:/data` for the job service. Data survives container exit;
-`run --rm` removes the finished container, so it disappears from Docker Desktop.
-Container `/tmp` scratch disappears too. Source is copied into images: rebuild
-when code changes. Tests generate data in temporary directories and do not mount
-or require the host data. `.gitignore` and `.dockerignore` exclude generated data,
-caches, environments, secrets, and personal workflow configuration. Published
+Compose mounts `./data:/data` for the job service, so host data persists between
+runs. `docker compose run --rm` removes finished containers and their `/tmp`
+scratch. Source is copied into images: rebuild when code changes. Tests generate
+data in temporary directories and do not mount or require host data. `.gitignore`
+and `.dockerignore` exclude generated data, caches, environments, secrets, and
+personal workflow configuration. Published
 `main` has a single root commit without those personal files; the earlier
 project history remains in local refs only.
 
@@ -389,10 +393,9 @@ Concurrent writers and coordinated rollback are unsupported.
 
 Jobs print runtime settings and stage counts to stdout/stderr; acquisition and
 verification helpers write the explicitly selected manifests/reports. Retain logs
-and a separate baseline when verifying reruns. Docker containers are one-shot:
-`run --rm` removes the container and `/tmp` scratch, while host-mounted `data/`
-persists. No scheduler, automatic retry, coordinated backup/rollback or CI is
-implemented. Run dates and archive coverage are selected explicitly.
+and a separate baseline when verifying reruns. No scheduler, automatic retry,
+coordinated backup/rollback, or CI is implemented. Run dates and archive
+coverage are selected explicitly.
 
 ## Implementation decisions and deviations
 
@@ -420,7 +423,6 @@ Version-tag image selection can change upstream.
 | --- | --- | --- | --- |
 | Full-day oracle is very slow when SQLite scratch is on the Windows bind | Two scratch-on-bind attempts were intentionally stopped; random-I/O scratch was moved into the container | Use the current `stream_oracle.py`, which creates SQLite scratch under container `/tmp` and persists expected rows/reports under the requested `/data/test` destination | Scratch-backed oracle completed in 1216.833 s and all seven datasets matched; no OOM cause was established |
 | An older image prints `shuffle_partitions=2` despite launcher `--conf spark.sql.shuffle.partitions=8` | Historical session code overwrote the launcher setting; source is copied into images | The source defect is fixed. Rebuild with `docker compose build`, then run the reproducibility command above before the pipeline | Fresh-process assertion and complete real-day run observed effective 8; logical output matched the original 2 baseline |
-| The finished job container disappears from Docker Desktop | Expected behavior of `docker compose run --rm`, not a failed persistence check | Inspect results under host `data/`, mounted as `/data`; retain required reports there, not in container `/tmp`. A persistent container is unnecessary | Compose bind and repeated host-output readbacks were verified; `/tmp` is disposable |
 
 ## Credits and licence
 
