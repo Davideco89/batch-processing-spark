@@ -12,6 +12,7 @@ from github_analytics.session import create_session
 from github_analytics.paths import PARQUET_ROOT
 from github_analytics.storage import read_date
 from github_analytics.publication import published_partition
+from github_analytics.quality import REJECTION_REASONS
 from scripts.profile_archive import DATASETS, SCHEMAS
 
 
@@ -71,6 +72,18 @@ def validate(spark, root, day, oracle=None, compare_root=None, manifest=None):
         result["optional_nulls"] = clean.agg(*[F.sum(F.col(key).isNull().cast("long")).alias(key) for key in ("org_login", "pr_number", "issue_number", "issue_labels")]).first().asDict()
         assert (frames["daily_volume"].agg(F.sum("event_count")).first()[0] or 0) == counts["clean"]
         assert (frames["event_counts"].agg(F.sum("event_count")).first()[0] or 0) == counts["clean"]
+        reason_metric = frames["rejection_counts"]
+        invalid_reason = (F.col("rejection_reason").isNull()
+                          | ~F.col("rejection_reason").isin(*REJECTION_REASONS)
+                          | F.col("event_count").isNull() | (F.col("event_count") <= 0))
+        assert not reason_metric.filter(invalid_reason).limit(1).count(), "Invalid rejection metric dimensions or count"
+        assert not reason_metric.groupBy("event_date", "rejection_reason").count().filter("count > 1").limit(1).count(), "Duplicate rejection metric grain"
+        # Recount the durable rejected checkpoint here, independently of the
+        # production aggregate. Full multiset equality detects swaps at equal totals.
+        reason_expected = frames["rejected"].groupBy("event_date", "rejection_reason").agg(F.count("*").alias("event_count"))
+        equal_rows(reason_metric, reason_expected, "rejection_counts")
+        assert (reason_metric.agg(F.sum("event_count")).first()[0] or 0) == counts["rejected"], "Rejection metric total differs"
+        result["published_rejection_counts"] = {row.rejection_reason: row.event_count for row in reason_metric.collect()}
         if oracle:
             expected = json.loads((Path(oracle) / "report.json").read_text())
             if manifest:

@@ -1,4 +1,4 @@
-"""Independently reconcile a bounded raw archive sample with all seven outputs.
+"""Independently reconcile a bounded raw archive sample with all eight outputs.
 
 Run with spark-submit. The raw oracle uses Python's JSON and datetime parsers;
 it does not call the pipeline's transformations or aggregations. Reports and
@@ -19,7 +19,7 @@ from github_analytics.storage import read_date
 from github_analytics.publication import published_partition
 
 DATASETS = ("ingested", "clean", "rejected", "event_counts", "daily_volume",
-            "top_repositories", "top_actors")
+            "top_repositories", "top_actors", "rejection_counts")
 BASE_FIELDS = {name: "string" for name in ("event_id", "event_type", "created_at", "repo_name",
                "actor_login", "org_login", "payload_action", "source_file")}
 BASE_FIELDS.update(pr_number="bigint", issue_number="bigint", issue_labels="array<string>", event_date="date")
@@ -31,6 +31,7 @@ SCHEMAS = {
     "daily_volume": {"event_date": "date", "event_count": "bigint"},
     "top_repositories": {"event_date": "date", "repo_name": "string", "event_count": "bigint", "rank": "int"},
     "top_actors": {"event_date": "date", "actor_login": "string", "event_count": "bigint", "rank": "int"},
+    "rejection_counts": {"event_date": "date", "rejection_reason": "string", "event_count": "bigint"},
 }
 CATEGORIES = {"PushEvent": "content", "PullRequestEvent": "collaboration",
               "IssuesEvent": "collaboration", "WatchEvent": "passive"}
@@ -155,6 +156,12 @@ def profile(spark, raw_root, output_root, day, top_n):
         assert datasets["clean"]["rows"] + datasets["rejected"]["rows"] == raw_lines
         actual_reasons = Counter({r.rejection_reason: r["count"] for r in frames["rejected"].groupBy("rejection_reason").count().collect()})
         assert actual_reasons == reasons, (actual_reasons, reasons)
+        expected_reason_rows = [dict(event_date=str(day), rejection_reason=reason, event_count=count)
+                                for reason, count in reasons.items()]
+        actual_reason_rows = [dict(row.asDict(), event_date=str(row.event_date))
+                              for row in frames["rejection_counts"].collect()]
+        assert Counter(map(canonical, actual_reason_rows)) == Counter(map(canonical, expected_reason_rows)), "Published rejection counts differ from independent raw oracle"
+        assert sum(row["event_count"] for row in actual_reason_rows) == datasets["rejected"]["rows"]
         rejected_rows = [r.asDict(recursive=True) for r in frames["rejected"].collect()]
         for row in rejected_rows:
             row["event_timestamp"] = str(row["event_timestamp"]) if row["event_timestamp"] is not None else None
@@ -223,7 +230,7 @@ if __name__ == "__main__":
             for name in DATASETS:
                 for key in ("rows", "schema", "sha256_rows", "partitions"):
                     assert result["datasets"][name][key] == previous["datasets"][name][key], (name, key)
-            result["rerun"] = "PASS: row counts, schemas, partitions and full-row multiset hashes unchanged for seven datasets"
+            result["rerun"] = "PASS: row counts, schemas, partitions and full-row multiset hashes unchanged for eight datasets"
         report = Path(args.report)
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(json.dumps(result, indent=2, default=str) + "\n")

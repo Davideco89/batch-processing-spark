@@ -9,7 +9,8 @@ import duckdb
 
 from github_analytics.export import export_date, SCHEMAS
 from scripts.verify_exports import verify_exports
-from github_analytics.publication import PublicationError, publish, published_partition
+from github_analytics.publication import PublicationError, publish, published_partition, recover_partition
+from tests.test_publication import fixture_writer, fail_at
 
 DAY = date(2025, 6, 1)
 NEXT = date(2025, 6, 2)
@@ -19,6 +20,7 @@ VALUES = {
     "daily_volume": [(3,)],
     "top_repositories": [(1, SPECIAL, 2), (2, "z/repo", 1)],
     "top_actors": [(1, "alice", 2), (2, "service[bot]", 1)],
+    "rejection_counts": [("outside_date", 2), ("unsupported_event_type", 1)],
 }
 
 
@@ -57,7 +59,7 @@ class ExportTests(unittest.TestCase):
         write_metrics(self.parquet, NEXT)
         for day in (DAY, NEXT):
             self.assertEqual(export_date(self.parquet, day, self.csv, self.database),
-                             {"event_counts": 1, "daily_volume": 1, "top_repositories": 2, "top_actors": 2})
+                             {"event_counts": 1, "daily_volume": 1, "top_repositories": 2, "top_actors": 2, "rejection_counts": 2})
         baseline = verify_exports(self.parquet, self.csv, self.database, DAY)
         snapshot = self.snapshot()
         files = {str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}
@@ -80,30 +82,91 @@ class ExportTests(unittest.TestCase):
             self.assertEqual((self.csv / f"event_date={NEXT}" / f"{name}.csv").read_bytes(), files[str(self.csv / f"event_date={NEXT}" / f"{name}.csv")])
             self.assertEqual((self.csv / f"event_date={DAY}" / f"{name}.csv").read_text(), ",".join(SCHEMAS[name]) + "\n")
 
-    def test_late_missing_input_rolls_back_four_tables_and_leaves_csv(self):
+    def test_late_missing_input_rolls_back_five_tables_other_date_and_csv(self):
         write_metrics(self.parquet, DAY)
+        write_metrics(self.parquet, NEXT)
         export_date(self.parquet, DAY, self.csv, self.database)
+        export_date(self.parquet, NEXT, self.csv, self.database)
         snapshot = self.snapshot()
         files = {str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}
         write_metrics(self.parquet, DAY, overrides={"daily_volume": ({"event_count": "BIGINT"}, [(99,)])})
-        Path(published_partition(self.parquet / "top_actors", DAY)[0][0]).unlink()
+        Path(published_partition(self.parquet / "rejection_counts", DAY)[0][0]).unlink()
         with self.assertRaises(PublicationError):
             export_date(self.parquet, DAY, self.csv, self.database)
         self.assertEqual(self.snapshot(), snapshot)
         self.assertEqual({str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}, files)
         # Failure in the last target table also rolls back earlier replacements.
         # Restore the tampered file from the still-retained prior generation.
-        damaged = self.parquet / "top_actors" / f"event_date={DAY}" / "_generations"
+        damaged = self.parquet / "rejection_counts" / f"event_date={DAY}" / "_generations"
         generations = sorted(damaged.iterdir(), key=lambda path: path.stat().st_mtime_ns)
         (generations[-1] / "part.parquet").write_bytes((generations[0] / "part.parquet").read_bytes())
         write_metrics(self.parquet, DAY)
         with duckdb.connect(str(self.database), config={"threads": 2}) as connection:
-            connection.execute("ALTER TABLE top_actors ADD COLUMN incompatible INTEGER DEFAULT 7")
+            connection.execute("ALTER TABLE rejection_counts ADD COLUMN incompatible INTEGER DEFAULT 7")
         snapshot = self.snapshot()
         write_metrics(self.parquet, DAY, overrides={"daily_volume": ({"event_count": "BIGINT"}, [(99,)])})
         with self.assertRaisesRegex(ValueError, "Unexpected target schema"):
             export_date(self.parquet, DAY, self.csv, self.database)
         self.assertEqual(self.snapshot(), snapshot)
+        self.assertEqual({str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}, files)
+
+    def test_rejection_metric_invalid_schema_date_null_positive_reason_grain_rolls_back(self):
+        write_metrics(self.parquet, DAY)
+        write_metrics(self.parquet, NEXT)
+        export_date(self.parquet, DAY, self.csv, self.database)
+        export_date(self.parquet, NEXT, self.csv, self.database)
+        snapshot = self.snapshot()
+        files = {str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}
+        normal = {"rejection_reason": "VARCHAR", "event_count": "BIGINT"}
+        cases = [
+            ({"rejection_reason": "VARCHAR", "event_count": "INTEGER"}, [("outside_date", 1)]),
+            ({"event_date": "DATE", **normal}, [(NEXT, "outside_date", 1)]),
+            (normal, [(None, 1)]), (normal, [("outside_date", None)]),
+            (normal, [("", 1)]), (normal, [("unknown_reason", 1)]),
+            (normal, [("outside_date ", 1)]), (normal, [("outside_date", 0)]),
+            (normal, [("outside_date", -1)]),
+            (normal, [("outside_date", 1), ("outside_date", 2)]),
+        ]
+        for schema, rows in cases:
+            with self.subTest(schema=schema, rows=rows):
+                write_metrics(self.parquet, DAY, overrides={
+                    "daily_volume": ({"event_count": "BIGINT"}, [(99,)]),
+                    "rejection_counts": (schema, rows)})
+                with self.assertRaises(ValueError):
+                    export_date(self.parquet, DAY, self.csv, self.database)
+                self.assertEqual(self.snapshot(), snapshot)
+                self.assertEqual({str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}, files)
+
+    def test_interrupted_fifth_metric_rolls_back_and_recovery_retry_succeeds(self):
+        write_metrics(self.parquet, DAY)
+        write_metrics(self.parquet, NEXT)
+        export_date(self.parquet, DAY, self.csv, self.database)
+        export_date(self.parquet, NEXT, self.csv, self.database)
+        snapshot = self.snapshot()
+        files = {str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}
+        write_metrics(self.parquet, DAY, overrides={"daily_volume": ({"event_count": "BIGINT"}, [(99,)])})
+        target = self.parquet / "rejection_counts"
+        with self.assertRaises(RuntimeError):
+            publish(target, DAY, fixture_writer(9), fail_at("stage_written"))
+        with self.assertRaises(PublicationError):
+            export_date(self.parquet, DAY, self.csv, self.database)
+        with self.assertRaises(PublicationError):
+            verify_exports(self.parquet, self.csv, self.database, DAY)
+        self.assertEqual(self.snapshot(), snapshot)
+        self.assertEqual({str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}, files)
+        recover_partition(target, DAY)
+        export_date(self.parquet, DAY, self.csv, self.database)
+        self.assertEqual(self.snapshot()["rejection_counts"], snapshot["rejection_counts"])
+        verify_exports(self.parquet, self.csv, self.database, DAY)
+
+    def test_reason_count_tampering_with_unchanged_sql_total_is_detected(self):
+        write_metrics(self.parquet, DAY)
+        export_date(self.parquet, DAY, self.csv, self.database)
+        with duckdb.connect(str(self.database), config={"threads": 2}) as connection:
+            connection.execute("UPDATE rejection_counts SET event_count=3-event_count")
+            self.assertEqual(connection.execute("SELECT sum(event_count) FROM rejection_counts").fetchone()[0], 3)
+        with self.assertRaisesRegex(AssertionError, "SQL rows differ"):
+            verify_exports(self.parquet, self.csv, self.database, DAY)
 
     def test_invalid_schema_date_null_and_grain_roll_back(self):
         write_metrics(self.parquet, DAY)

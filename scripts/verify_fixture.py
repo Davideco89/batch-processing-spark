@@ -14,7 +14,7 @@ from github_analytics.storage import read_date, read_dates
 def verify(spark, root):
     day = date(2025, 6, 1)
     expected = {"ingested": 13, "clean": 8, "rejected": 5, "event_counts": 6,
-                "daily_volume": 1, "top_repositories": 2, "top_actors": 3}
+                "daily_volume": 1, "top_repositories": 2, "top_actors": 3, "rejection_counts": 5}
     snapshot = {}
     for name, count in expected.items():
         frame = read_date(spark, Path(root) / name, day)
@@ -30,6 +30,9 @@ def verify(spark, root):
     reasons = {r.rejection_reason: r["count"] for r in read_date(spark, Path(root) / "rejected", day).groupBy("rejection_reason").count().collect()}
     assert reasons == {"corrupt_json": 1, "missing_actor_login": 1, "invalid_timestamp": 1,
                        "unsupported_event_type": 1, "outside_date": 1}, reasons
+    reason_rows = read_date(spark, Path(root) / "rejection_counts", day).collect()
+    assert {row.rejection_reason: row.event_count for row in reason_rows} == reasons
+    assert len(reason_rows) == len(reasons) and sum(row.event_count for row in reason_rows) == 5
     assert read_date(spark, Path(root) / "daily_volume", day).first().event_count == 8
     metrics = read_date(spark, Path(root) / "event_counts", day)
     assert sum(r.event_count for r in metrics.collect()) == 8
@@ -57,7 +60,7 @@ if __name__ == "__main__":
         path = Path(args.snapshot)
         if args.compare:
             assert snapshot == json.loads(path.read_text()), "Parquet contents changed on rerun"
-            print("Rerun verified: all seven datasets unchanged, including other dates; 8 unique first-day event IDs.", flush=True)
+            print("Rerun verified: all eight datasets unchanged, including other dates; 8 unique first-day event IDs.", flush=True)
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(snapshot, indent=2))

@@ -1,6 +1,6 @@
 """Export existing aggregate Parquet; do not recompute pipeline metrics.
 
-DuckDB replaces all four date slices in one transaction. CSV replacement is
+DuckDB replaces all five date slices in one transaction. CSV replacement is
 atomic per file, not across both files or the database; rerun after interruption.
 Local single-writer usage only.
 """
@@ -16,15 +16,18 @@ import tempfile
 
 import duckdb
 from github_analytics.publication import published_partition
+from github_analytics.quality import REJECTION_REASONS
 
 SCHEMAS = {
     "event_counts": {"event_date": "DATE", "event_type": "VARCHAR", "event_hour": "INTEGER", "is_bot": "BOOLEAN", "event_count": "BIGINT"},
     "daily_volume": {"event_date": "DATE", "event_count": "BIGINT"},
     "top_repositories": {"event_date": "DATE", "rank": "INTEGER", "repo_name": "VARCHAR", "event_count": "BIGINT"},
     "top_actors": {"event_date": "DATE", "rank": "INTEGER", "actor_login": "VARCHAR", "event_count": "BIGINT"},
+    "rejection_counts": {"event_date": "DATE", "rejection_reason": "VARCHAR", "event_count": "BIGINT"},
 }
 GRAINS = {"event_counts": "event_date,event_type,event_hour,is_bot", "daily_volume": "event_date",
-          "top_repositories": "event_date,rank", "top_actors": "event_date,rank"}
+          "top_repositories": "event_date,rank", "top_actors": "event_date,rank",
+          "rejection_counts": "event_date,rejection_reason"}
 RANKINGS = ("top_repositories", "top_actors")
 
 
@@ -54,6 +57,10 @@ def load_partition(connection, name, parquet_root, day):
         raise ValueError(f"Duplicate aggregate grain in {name}")
     if name == "event_counts" and connection.execute(f"SELECT count(*) FROM {table} WHERE event_hour NOT BETWEEN 0 AND 23 OR trim(event_type) = ''").fetchone()[0]:
         raise ValueError("Invalid event dimensions")
+    if name == "rejection_counts":
+        placeholders = ",".join("?" for _ in REJECTION_REASONS)
+        if connection.execute(f"SELECT count(*) FROM {table} WHERE rejection_reason NOT IN ({placeholders})", REJECTION_REASONS).fetchone()[0]:
+            raise ValueError("Invalid rejection reason")
     if name in RANKINGS:
         entity = "repo_name" if name == "top_repositories" else "actor_login"
         rows = connection.execute(f"SELECT rank,{entity},event_count FROM {table} ORDER BY rank").fetchall()

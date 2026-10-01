@@ -7,7 +7,7 @@ from datetime import date
 from pathlib import Path
 from pyspark import StorageLevel
 
-from github_analytics.aggregate import aggregate
+from github_analytics.aggregate import aggregate, rejection_counts
 from github_analytics.ingest import ingest
 from github_analytics.session import create_session
 from github_analytics.storage import read_date, write_date
@@ -34,10 +34,14 @@ def run_stage(spark, stage, event_date, raw_root, output_root, top_n=10):
             clean.unpersist()
             rejected.unpersist()
     if stage in ("aggregate", "pipeline"):
+        # Resolve both complete restart checkpoints before publishing metrics.
+        rejected = read_date(spark, root / "rejected", event_date)
+        reasons = rejection_counts(rejected, event_date)
         frame = read_date(spark, root / "clean", event_date).cache()
         try:
             for name, metric in aggregate(frame, top_n).items():
                 write_date(metric, root / name, event_date)
+            write_date(reasons, root / "rejection_counts", event_date)
             print(f"Aggregated {event_date}: {frame.count()} events", flush=True)
         finally:
             frame.unpersist()

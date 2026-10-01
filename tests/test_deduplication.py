@@ -19,7 +19,7 @@ from tests.fixture_data import event, write_archive
 
 DAY = date(2025, 6, 1)
 NEXT_DAY = date(2025, 6, 2)
-DATASETS = ("ingested", "clean", "rejected", "event_counts", "daily_volume", "top_repositories", "top_actors")
+DATASETS = ("ingested", "clean", "rejected", "event_counts", "daily_volume", "top_repositories", "top_actors", "rejection_counts")
 
 
 def duplicate_fixture(raw):

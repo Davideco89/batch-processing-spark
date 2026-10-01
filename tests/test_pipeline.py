@@ -126,8 +126,9 @@ class PipelineTests(unittest.TestCase):
             write_fixture(raw)
             for day in (DAY, date(2025, 6, 2)):
                 run_stage(self.spark, "pipeline", day, raw, output)
-            names = ["ingested", "clean", "rejected", "event_counts", "daily_volume", "top_repositories", "top_actors"]
+            names = ["ingested", "clean", "rejected", "event_counts", "daily_volume", "top_repositories", "top_actors", "rejection_counts"]
             snapshot = {name: sorted(read_dates(self.spark, output / name).toJSON().collect()) for name in names}
+            other_snapshot = {name: sorted(read_date(self.spark, output / name, date(2025, 6, 2)).toJSON().collect()) for name in names}
             run_stage(self.spark, "pipeline", DAY, raw, output)
             for name in names:
                 self.assertEqual(sorted(read_dates(self.spark, output / name).toJSON().collect()), snapshot[name], name)
@@ -137,6 +138,12 @@ class PipelineTests(unittest.TestCase):
             for name in names:
                 self.assertEqual(sorted(read_date(self.spark, output / name, DAY).toJSON().collect()),
                                  sorted(read_date(self.spark, separate / name, DAY).toJSON().collect()), name)
+            # Aggregate restart consumes only clean/rejected durable checkpoints.
+            run_stage(self.spark, "aggregate", DAY, Path(directory) / "absent-raw", separate)
+            self.assertEqual({r.rejection_reason: r.event_count for r in read_date(self.spark, separate / "rejection_counts", DAY).collect()},
+                             {"corrupt_json": 1, "missing_actor_login": 1, "invalid_timestamp": 1,
+                              "unsupported_event_type": 1, "outside_date": 1})
+            self.assertEqual(read_date(self.spark, output / "rejection_counts", date(2025, 6, 2)).count(), 0)
             # If a rerun has no accepted events, stale rows must disappear.
             invalid = read_date(self.spark, output / "ingested", DAY).filter(F.col("event_id") == "10")
             invalid = self.spark.createDataFrame(invalid.collect(), invalid.schema)
@@ -146,7 +153,21 @@ class PipelineTests(unittest.TestCase):
             for name in ("clean", "event_counts", "daily_volume", "top_repositories", "top_actors"):
                 self.assertEqual(read_date(self.spark, output / name, DAY).count(), 0, name)
                 self.assertEqual(sorted(read_date(self.spark, output / name, date(2025, 6, 2)).toJSON().collect()),
-                                 sorted(r for r in snapshot[name] if '2025-06-02' in r), name)
+                                 other_snapshot[name], name)
+            self.assertEqual({r.rejection_reason: r.event_count for r in read_date(self.spark, output / "rejection_counts", DAY).collect()},
+                             {"missing_actor_login": 1})
+            # Replace the rejected checkpoint with a typed empty publication.
+            # Old reasons disappear without creating zero-valued synthetic rows.
+            rejected = read_date(self.spark, output / "rejected", DAY)
+            write_date(rejected.limit(0), output / "rejected", DAY)
+            run_stage(self.spark, "aggregate", DAY, Path(directory) / "absent-raw", output)
+            empty = read_date(self.spark, output / "rejection_counts", DAY)
+            self.assertEqual(empty.count(), 0)
+            self.assertEqual({f.name: f.dataType.simpleString() for f in empty.schema},
+                             {"event_date": "date", "rejection_reason": "string", "event_count": "bigint"})
+            for name in names:
+                self.assertEqual(sorted(read_date(self.spark, output / name, date(2025, 6, 2)).toJSON().collect()),
+                                 other_snapshot[name], name)
 
     def test_missing_input_does_not_create_output(self):
         with tempfile.TemporaryDirectory() as directory:

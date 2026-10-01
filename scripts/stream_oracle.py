@@ -121,7 +121,9 @@ def build_oracle(raw_root, day, destination):
                 connection.commit()
         metrics = {"event_counts": [dict(event_date=str(day), event_type=kind, event_hour=hour, is_bot=bot, event_count=count)
                                     for (kind, hour, bot), count in groups.items()],
-                   "daily_volume": [dict(event_date=str(day), event_count=accepted)] if accepted else []}
+                   "daily_volume": [dict(event_date=str(day), event_count=accepted)] if accepted else [],
+                   "rejection_counts": [dict(event_date=str(day), rejection_reason=reason, event_count=count)
+                                        for reason, count in sorted(reasons.items())]}
         for dataset, key, column in (("top_repositories", "repo_name", "repo"), ("top_actors", "actor_login", "actor")):
             rankings = connection.execute(f"SELECT {column},count(*) AS n FROM metrics GROUP BY {column} ORDER BY n DESC,{column} LIMIT 10")
             metrics[dataset] = [dict(event_date=str(day), **{key: entity}, event_count=count, rank=rank)

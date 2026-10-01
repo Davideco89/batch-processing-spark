@@ -18,6 +18,7 @@ EXPECTED = {
     "daily_volume": [("event_date", "DATE"), ("event_count", "BIGINT")],
     "top_repositories": [("event_date", "DATE"), ("rank", "INTEGER"), ("repo_name", "VARCHAR"), ("event_count", "BIGINT")],
     "top_actors": [("event_date", "DATE"), ("rank", "INTEGER"), ("actor_login", "VARCHAR"), ("event_count", "BIGINT")],
+    "rejection_counts": [("event_date", "DATE"), ("rejection_reason", "VARCHAR"), ("event_count", "BIGINT")],
 }
 
 
@@ -31,9 +32,13 @@ def row_hash(rows):
 
 def verify_exports(parquet_root, csv_root, database, day):
     result = {"date": str(day), "duckdb_version": duckdb.__version__, "tables": {}, "csv_files": {}}
+    # Gate every consumed partition before comparing any business rows. An
+    # incomplete fifth dataset must be identified even if an earlier table also
+    # needs re-export; immutable resolved files remain stable after this gate.
+    partitions = {name: published_partition(Path(parquet_root) / name, day)[0] for name in EXPECTED}
     with duckdb.connect(config={"threads": 2}) as source, duckdb.connect(str(database), read_only=True, config={"threads": 2}) as target:
         for name, fields in EXPECTED.items():
-            files, _ = published_partition(Path(parquet_root) / name, day)
+            files = partitions[name]
             columns = ",".join(column for column, _ in fields)
             relation = "read_parquet(?, hive_partitioning=true)"
             physical = {row[0]: row[1] for row in source.execute(f"DESCRIBE SELECT * FROM {relation}", [files]).fetchall()}

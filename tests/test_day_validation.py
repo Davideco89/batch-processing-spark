@@ -11,6 +11,7 @@ from unittest.mock import patch
 from pyspark.sql import SparkSession, functions as F
 from github_analytics.session import create_session
 from github_analytics.runner import run_stage
+from github_analytics.storage import write_date
 from scripts.acquire_archive import acquire, validate_plan
 from scripts.stream_oracle import build_oracle
 from scripts.validate_parquet import validate, equal_rows, read_partition, validate_sources
@@ -70,13 +71,28 @@ class DistributedOracleTests(unittest.TestCase):
             self.assertEqual((expected["raw_lines"], expected["accepted"], expected["rejected"]), (13, 3, 10))
             self.assertEqual(expected["rejection_reasons"]["duplicate_event_id"], 2)
             self.assertEqual(expected["rejection_reasons"]["conflicting_event_id"], 4)
+            reason_rows = [json.loads(line) for line in (oracle / "rejection_counts.json").read_text().splitlines()]
+            self.assertEqual({row["rejection_reason"]: row["event_count"] for row in reason_rows}, expected["rejection_reasons"])
+            self.assertTrue(all(row["event_date"] == str(DAY) for row in reason_rows))
             rows = [json.loads(line) for line in (oracle / "clean.json").read_text().splitlines()]
             self.assertEqual(next(row for row in rows if row["event_id"] == "4")["pr_number"], 42)
             run_stage(self.spark, "pipeline", DAY, raw, output)
             result = validate(self.spark, output, DAY, oracle=oracle)
             self.assertEqual(result["datasets"]["clean"]["rows"], 3)
+            self.assertEqual(result["published_rejection_counts"], expected["rejection_reasons"])
             frame = read_partition(self.spark, output, "clean", DAY)
             with self.assertRaisesRegex(AssertionError, "multiplicity"):
                 equal_rows(frame.unionByName(frame.limit(1)), frame, "clean")
             with self.assertRaisesRegex(AssertionError, "multiplicity"):
                 equal_rows(frame.withColumn("event_timestamp", F.col("event_timestamp") + F.expr("INTERVAL 1 SECOND")), frame, "clean")
+            reasons = read_partition(self.spark, output, "rejection_counts", DAY)
+            # Swap two counts while preserving the total: aggregate-only sum
+            # checks would miss this corruption, but exact reason checks must not.
+            tampered = reasons.withColumn("event_count", F.when(F.col("rejection_reason") == "duplicate_event_id", F.lit(4))
+                                          .when(F.col("rejection_reason") == "conflicting_event_id", F.lit(2))
+                                          .otherwise(F.col("event_count")).cast("long"))
+            write_date(tampered, output / "rejection_counts", DAY)
+            with self.assertRaisesRegex(AssertionError, "multiplicity"):
+                validate(self.spark, output, DAY)
+            with self.assertRaisesRegex(AssertionError, "multiplicity"):
+                validate(self.spark, output, DAY, oracle=oracle)
