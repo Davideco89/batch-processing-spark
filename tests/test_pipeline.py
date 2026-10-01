@@ -10,7 +10,7 @@ from github_analytics.aggregate import aggregate
 from github_analytics.ingest import ingest
 from github_analytics.runner import run_stage
 from github_analytics.session import create_session
-from github_analytics.storage import read_date, write_date
+from github_analytics.storage import read_date, read_dates, write_date
 from github_analytics.transform import transform
 from tests.fixture_data import event, write_archive, write_fixture
 
@@ -85,6 +85,41 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual({r.rejection_reason for r in rejected.collect()},
                              {"missing_repo_name", "missing_event_id", "missing_event_type"})
 
+    def test_multiple_defects_precedence_utc_boundaries_and_bot_suffix_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            records = []
+            for identifier, kind, actor, repo, stamp in [
+                (None, None, None, None, "invalid"),
+                ("missing-type", " ", None, None, "invalid"),
+                ("missing-repo", "ForkEvent", None, " ", "invalid"),
+                ("missing-actor", "ForkEvent", " ", "acme/repo", "invalid"),
+                ("invalid-stamp", "ForkEvent", "alice", "acme/repo", "invalid"),
+                ("unsupported", "ForkEvent", "alice", "acme/repo", "2025-06-02T00:00:00Z"),
+                ("outside", "PushEvent", "alice", "acme/repo", "2025-06-01T00:30:00+01:00"),
+                ("mid-string", "PushEvent", "app[bot]middle", "acme/repo", "2025-05-31T23:30:00-01:00"),
+                ("suffix", "WatchEvent", "APP[BoT]", "acme/repo", "2025-06-02T00:30:00+01:00"),
+                ("named-bot", "PushEvent", "dependabot", "acme/repo", "2025-06-01T00:00:00Z"),
+            ]:
+                record = event(identifier, kind, actor, repo, stamp)
+                record["id"] = identifier
+                records.append(record)
+            write_archive(Path(directory) / "2025-06-01-0.json.gz", records, malformed=True)
+            ingested = ingest(self.spark, directory, DAY)
+            clean, rejected = transform(ingested, DAY)
+            expected = {"missing-type": "missing_event_type", "missing-repo": "missing_repo_name",
+                        "missing-actor": "missing_actor_login", "invalid-stamp": "invalid_timestamp",
+                        "unsupported": "unsupported_event_type", "outside": "outside_date"}
+            rows = rejected.collect()
+            self.assertEqual({row.event_id: row.rejection_reason for row in rows if row.event_id is not None}, expected)
+            self.assertEqual({row.rejection_reason for row in rows if row.event_id is None}, {"corrupt_json", "missing_event_id"})
+            self.assertEqual((ingested.count(), clean.count(), len(rows)), (11, 3, 8))
+            accepted = {row.event_id: row for row in clean.collect()}
+            self.assertEqual((accepted["mid-string"].event_date, accepted["mid-string"].event_hour), (DAY, 0))
+            self.assertEqual((accepted["suffix"].event_date, accepted["suffix"].event_hour), (DAY, 23))
+            self.assertFalse(accepted["mid-string"].is_bot)
+            self.assertFalse(accepted["named-bot"].is_bot)
+            self.assertTrue(accepted["suffix"].is_bot)
+
     def test_chain_independent_stages_rerun_and_empty_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             raw, output, separate = [Path(directory) / name for name in ("raw", "output", "separate")]
@@ -92,10 +127,10 @@ class PipelineTests(unittest.TestCase):
             for day in (DAY, date(2025, 6, 2)):
                 run_stage(self.spark, "pipeline", day, raw, output)
             names = ["ingested", "clean", "rejected", "event_counts", "daily_volume", "top_repositories", "top_actors"]
-            snapshot = {name: sorted(self.spark.read.parquet(str(output / name)).toJSON().collect()) for name in names}
+            snapshot = {name: sorted(read_dates(self.spark, output / name).toJSON().collect()) for name in names}
             run_stage(self.spark, "pipeline", DAY, raw, output)
             for name in names:
-                self.assertEqual(sorted(self.spark.read.parquet(str(output / name)).toJSON().collect()), snapshot[name], name)
+                self.assertEqual(sorted(read_dates(self.spark, output / name).toJSON().collect()), snapshot[name], name)
             for stage in ("ingest", "transform", "aggregate"):
                 run_stage(self.spark, stage, DAY, raw, separate)
             # source_file is identical because both executions use the same raw fixture.

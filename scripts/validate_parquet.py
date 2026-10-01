@@ -10,12 +10,13 @@ from pyspark import StorageLevel
 from pyspark.sql import functions as F, types as T
 from github_analytics.session import create_session
 from github_analytics.paths import PARQUET_ROOT
+from github_analytics.storage import read_date
+from github_analytics.publication import published_partition
 from scripts.profile_archive import DATASETS, SCHEMAS
 
 
 def read_partition(spark, root, name, day):
-    path = Path(root) / name
-    return spark.read.option("basePath", str(path)).parquet(str(path / f"event_date={day}"))
+    return read_date(spark, Path(root) / name, day)
 
 
 def equal_rows(left, right, name):
@@ -44,7 +45,7 @@ def validate(spark, root, day, oracle=None, compare_root=None, manifest=None):
             frames[name] = frame
             assert {field.name: field.dataType.simpleString() for field in frame.schema} == SCHEMAS[name], (name, "schema")
             assert not frame.filter(F.col("event_date").isNull() | (F.col("event_date") != F.lit(day))).limit(1).count(), (name, "partition date")
-            files = list((Path(root) / name / f"event_date={day}").glob("*.parquet"))
+            files = [Path(path) for path in published_partition(Path(root) / name, day)[0]]
             result["datasets"][name] = {"rows": frame.count(), "schema": frame.schema.simpleString(),
                                         "files": len(files), "bytes": sum(path.stat().st_size for path in files),
                                         "minimum_file_bytes": min(path.stat().st_size for path in files),

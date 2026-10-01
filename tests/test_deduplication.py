@@ -12,7 +12,7 @@ from pyspark.sql import SparkSession, functions as F
 from github_analytics.ingest import ingest
 from github_analytics.runner import run_stage
 from github_analytics.session import create_session
-from github_analytics.storage import read_date, write_date
+from github_analytics.storage import read_date, read_dates, write_date
 from github_analytics.transform import transform
 from scripts.profile_archive import profile, raw_oracle
 from tests.fixture_data import event, write_archive
@@ -80,10 +80,10 @@ class DeduplicationTests(unittest.TestCase):
             report = profile(self.spark, raw, output, DAY, 10)
             self.assertEqual((report["accepted"], report["rejected"], report["duplicate_event_ids"]), (3, 10, 0))
             run_stage(self.spark, "pipeline", NEXT_DAY, raw, output)
-            snapshot = {name: sorted(self.spark.read.parquet(str(output / name)).toJSON().collect()) for name in DATASETS}
+            snapshot = {name: sorted(read_dates(self.spark, output / name).toJSON().collect()) for name in DATASETS}
             run_stage(self.spark, "pipeline", DAY, raw, output)
             for name in DATASETS:
-                self.assertEqual(sorted(self.spark.read.parquet(str(output / name)).toJSON().collect()), snapshot[name])
+                self.assertEqual(sorted(read_dates(self.spark, output / name).toJSON().collect()), snapshot[name])
             for stage in ("ingest", "transform", "aggregate"):
                 run_stage(self.spark, stage, DAY, raw, separate)
             for name in DATASETS:

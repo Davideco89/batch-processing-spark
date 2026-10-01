@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from github_analytics.session import create_session
-from github_analytics.storage import read_date
+from github_analytics.storage import read_date, read_dates
 
 
 def verify(spark, root):
@@ -19,7 +19,7 @@ def verify(spark, root):
     for name, count in expected.items():
         frame = read_date(spark, Path(root) / name, day)
         assert frame.count() == count, (name, frame.count(), count)
-        snapshot[name] = sorted(spark.read.parquet(str(Path(root) / name)).toJSON().collect())
+        snapshot[name] = sorted(read_dates(spark, Path(root) / name).toJSON().collect())
         print(f"{name}: {count} rows; schema={frame.schema.simpleString()}", flush=True)
     clean = read_date(spark, Path(root) / "clean", day)
     assert clean.select("event_id").distinct().count() == 8

@@ -15,6 +15,7 @@ from github_analytics.paths import RAW_ROOT, PARQUET_ROOT, CSV_ROOT, DATABASE
 from github_analytics.session import create_session
 from scripts.profile_archive import DATASETS
 from scripts.verify_exports import verify_exports
+from github_analytics.storage import read_date
 
 
 def historical_source_uri(recorded, supplied_uri):
@@ -35,8 +36,8 @@ def compare(spark, old_root, new_root, old_archive, new_archive, old_uri, day):
     results = {}
     for name in DATASETS:
         old_path, new_path = Path(old_root) / name, Path(new_root) / name
-        old = spark.read.option("basePath", str(old_path)).parquet(str(old_path / f"event_date={day}"))
-        new = spark.read.option("basePath", str(new_path)).parquet(str(new_path / f"event_date={day}"))
+        old = read_date(spark, old_path, day)
+        new = read_date(spark, new_path, day)
         assert old.schema == new.schema, (name, "schema")
         assert sorted(p.name for p in old_path.glob("event_date=*")) == sorted(p.name for p in new_path.glob("event_date=*")), (name, "partitions")
         if "source_file" in new.columns:

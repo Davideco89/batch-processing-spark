@@ -9,6 +9,7 @@ import duckdb
 
 from github_analytics.export import export_date, SCHEMAS
 from scripts.verify_exports import verify_exports
+from github_analytics.publication import PublicationError, publish, published_partition
 
 DAY = date(2025, 6, 1)
 NEXT = date(2025, 6, 2)
@@ -29,10 +30,13 @@ def write_metrics(root, day, empty=False, overrides=None):
             connection.execute("CREATE OR REPLACE TABLE fixture (" + ",".join(f"{k} {v}" for k, v in schema.items()) + ")")
             if not empty and rows:
                 connection.executemany("INSERT INTO fixture VALUES (" + ",".join("?" for _ in schema) + ")", rows)
-            partition = root / name / f"event_date={day}"
-            partition.mkdir(parents=True, exist_ok=True)
-            path = str(partition / "part.parquet").replace("'", "''")
-            connection.execute(f"COPY fixture TO '{path}' (FORMAT PARQUET)")
+            def writer(stage):
+                stage.mkdir()
+                path = str(stage / "part.parquet").replace("'", "''")
+                connection.execute(f"COPY fixture TO '{path}' (FORMAT PARQUET)")
+                (stage / "_SUCCESS").touch()
+                return connection.execute("SELECT count(*) FROM fixture").fetchone()[0], schema
+            publish(root / name, day, writer)
 
 
 class ExportTests(unittest.TestCase):
@@ -82,12 +86,16 @@ class ExportTests(unittest.TestCase):
         snapshot = self.snapshot()
         files = {str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}
         write_metrics(self.parquet, DAY, overrides={"daily_volume": ({"event_count": "BIGINT"}, [(99,)])})
-        (self.parquet / "top_actors" / f"event_date={DAY}" / "part.parquet").unlink()
-        with self.assertRaises(FileNotFoundError):
+        Path(published_partition(self.parquet / "top_actors", DAY)[0][0]).unlink()
+        with self.assertRaises(PublicationError):
             export_date(self.parquet, DAY, self.csv, self.database)
         self.assertEqual(self.snapshot(), snapshot)
         self.assertEqual({str(path): path.read_bytes() for path in self.csv.rglob("*.csv")}, files)
         # Failure in the last target table also rolls back earlier replacements.
+        # Restore the tampered file from the still-retained prior generation.
+        damaged = self.parquet / "top_actors" / f"event_date={DAY}" / "_generations"
+        generations = sorted(damaged.iterdir(), key=lambda path: path.stat().st_mtime_ns)
+        (generations[-1] / "part.parquet").write_bytes((generations[0] / "part.parquet").read_bytes())
         write_metrics(self.parquet, DAY)
         with duckdb.connect(str(self.database), config={"threads": 2}) as connection:
             connection.execute("ALTER TABLE top_actors ADD COLUMN incompatible INTEGER DEFAULT 7")

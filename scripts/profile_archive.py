@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 
 from github_analytics.session import create_session
+from github_analytics.storage import read_date
+from github_analytics.publication import published_partition
 
 DATASETS = ("ingested", "clean", "rejected", "event_counts", "daily_volume",
             "top_repositories", "top_actors")
@@ -128,14 +130,14 @@ def profile(spark, raw_root, output_root, day, top_n):
     for name in DATASETS:
         root = Path(output_root) / name
         partition = root / f"event_date={day}"
-        frame = spark.read.option("basePath", str(root)).parquet(str(partition)).cache()
+        frame = read_date(spark, root, day).cache()
         frames[name] = frame
         assert {field.name: field.dataType.simpleString() for field in frame.schema} == SCHEMAS[name], (name, frame.schema)
         serialized = sorted(frame.toJSON().collect())
         datasets[name] = {"rows": len(serialized), "schema": frame.schema.simpleString(),
                           "sha256_rows": hashlib.sha256("\n".join(serialized).encode()).hexdigest(),
                           "partitions": sorted(p.name for p in root.glob("event_date=*")),
-                          "parquet_files": len(list(partition.glob("*.parquet")))}
+                          "parquet_files": len(published_partition(root, day)[0])}
         assert f"event_date={day}" in datasets[name]["partitions"], name
         assert datasets[name]["parquet_files"] > 0, name
         assert all(str(r.event_date) == str(day) for r in frame.select("event_date").distinct().collect()), name

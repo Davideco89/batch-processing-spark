@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import duckdb
+from github_analytics.publication import published_partition
 
 EXPECTED = {
     "event_counts": [("event_date", "DATE"), ("event_type", "VARCHAR"), ("event_hour", "INTEGER"), ("is_bot", "BOOLEAN"), ("event_count", "BIGINT")],
@@ -32,9 +33,7 @@ def verify_exports(parquet_root, csv_root, database, day):
     result = {"date": str(day), "duckdb_version": duckdb.__version__, "tables": {}, "csv_files": {}}
     with duckdb.connect(config={"threads": 2}) as source, duckdb.connect(str(database), read_only=True, config={"threads": 2}) as target:
         for name, fields in EXPECTED.items():
-            files = sorted(str(path) for path in (Path(parquet_root) / name / f"event_date={day}").glob("*.parquet"))
-            if not files:
-                raise FileNotFoundError(f"Missing source {name}")
+            files, _ = published_partition(Path(parquet_root) / name, day)
             columns = ",".join(column for column, _ in fields)
             relation = "read_parquet(?, hive_partitioning=true)"
             physical = {row[0]: row[1] for row in source.execute(f"DESCRIBE SELECT * FROM {relation}", [files]).fetchall()}

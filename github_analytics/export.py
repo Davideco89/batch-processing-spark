@@ -15,6 +15,7 @@ from pathlib import Path
 import tempfile
 
 import duckdb
+from github_analytics.publication import published_partition
 
 SCHEMAS = {
     "event_counts": {"event_date": "DATE", "event_type": "VARCHAR", "event_hour": "INTEGER", "is_bot": "BOOLEAN", "event_count": "BIGINT"},
@@ -29,9 +30,7 @@ RANKINGS = ("top_repositories", "top_actors")
 
 def load_partition(connection, name, parquet_root, day):
     """Validate physical schemas before reading a requested-date partition."""
-    files = sorted(str(path) for path in (Path(parquet_root) / name / f"event_date={day}").glob("*.parquet"))
-    if not files:
-        raise FileNotFoundError(f"No Parquet files for {name}, {day}")
+    files, _ = published_partition(Path(parquet_root) / name, day)
     expected = SCHEMAS[name]
     physical = None
     for path in files:
