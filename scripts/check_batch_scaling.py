@@ -65,11 +65,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True)
     parser.add_argument("--mode", choices=("full", "volume"), default="full")
+    parser.add_argument("--skip-volume", action="store_true",
+                        help="Reuse separately recorded volume benchmarks during integrated validation")
     args = parser.parse_args()
     root = Path(args.root).resolve()
-    allowed = Path("/data/test/batch-scaling").resolve()
-    if allowed not in root.parents or root.exists():
-        parser.error("Use a new isolated directory below /data/test/batch-scaling")
+    allowed = (Path("/data/test/batch-scaling"), Path("/data/test/integrated-validation"))
+    if not any(path.resolve() in root.parents for path in allowed) or root.exists():
+        parser.error("Use a new isolated directory below /data/test/batch-scaling or /data/test/integrated-validation")
     root.mkdir(parents=True)
     if args.mode == "volume":
         spark = create_session("batch-stage-volume-checks")
@@ -184,10 +186,12 @@ def main():
         results["other_date_files_unchanged"] = len(other)
         # Different real serialized inputs: wide business text deliberately
         # exercises policy growth. These are synthetic CPU/volume workloads.
-        results["volumes"] = measure_volumes(spark, root)
+        results["volumes"] = [] if args.skip_volume else measure_volumes(spark, root)
+        results["volume_checks_skipped"] = args.skip_volume
         (root / "report.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
         print("PASS: bounded CLI range, fail/resume, effective startup settings, exact restart equivalence, "
-              "seven partial consumer gates, recovery, empty rerun, other-date preservation and stage volume workloads", flush=True)
+              "seven partial consumer gates, recovery, empty rerun and other-date preservation"
+              + ("; volume workloads explicitly skipped" if args.skip_volume else "; stage volume workloads verified"), flush=True)
     finally:
         spark.stop()
 

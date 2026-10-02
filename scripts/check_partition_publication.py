@@ -44,9 +44,9 @@ def main():
     parser.add_argument("--mode", required=True, choices=("setup", "write", "probe", "recover", "commit-crash", "verify"))
     args = parser.parse_args()
     root = Path(args.root).resolve()
-    allowed = Path("/data/test/partition-publication").resolve()
-    if root == allowed or allowed not in root.parents:
-        parser.error("Use a new isolated experiment directory under /data/test/partition-publication")
+    allowed = (Path("/data/test/partition-publication"), Path("/data/test/integrated-validation"))
+    if not any(path.resolve() in root.parents for path in allowed):
+        parser.error("Use a new isolated experiment directory under /data/test/partition-publication or /data/test/integrated-validation")
     marker = root / "_experiment.json"
     if args.mode == "setup":
         if root.exists() and any(root.iterdir()):

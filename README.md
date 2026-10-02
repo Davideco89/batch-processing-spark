@@ -1,78 +1,84 @@
 # GitHub Events Analytics with PySpark
 
-A date-parameterized batch pipeline for [GH Archive](https://www.gharchive.org/)
-hourly GitHub events. It reads gzip JSON Lines, normalizes nested fields, validates
-and deduplicates selected activity, and produces date-partitioned Parquet,
-embedded DuckDB tables, and CSV rankings.
+A daily batch pipeline for [GH Archive](https://www.gharchive.org/) hourly GitHub
+events. PySpark reads gzip JSON Lines, normalizes nested fields, validates and
+deduplicates selected activity, then publishes eight date-partitioned Parquet
+datasets. Five metric tables are exported to DuckDB and two rankings to CSV.
 
 ## Scope and requirements
 
-This implements the [DataSkew batch processing brief](https://dataskew.io/projects/batch-processing-spark/):
-modular ingestion, transformation and aggregation jobs in Docker, date-parameterized
-execution as a chain or separate stages, and partitioned Parquet metrics with
-repeatable results. Explicit schema validation, autonomous tests, event-ID
-deduplication, DuckDB exports, and CSV summaries are adopted extensions.
-The latest local validation covers **all 24 hourly archives for 2025-06-02 UTC**;
-2025-06-01 covers only 00:00–01:00 UTC. Neither dataset represents GitHub activity
-outside its declared input coverage. Scheduling and dashboards are outside scope.
+The [DataSkew brief](https://dataskew.io/projects/batch-processing-spark/) requires
+modular ingestion, transformation and aggregation, Docker/`spark-submit` execution,
+date parameters and partitioned analytical outputs. Implemented extensions include
+explicit schemas, autonomous unit/integration tests, deterministic event-ID dedup,
+DuckDB, CSV, rejection metrics, bounded date loops, resource controls and interrupted
+publication recovery. Scheduling, dashboards and a bot registry are outside scope.
+
+Validation on 2026-10-02 covers **all 24 hourly archives for 2025-06-02 UTC**,
+without truncation: 3,671,908 input events. Synthetic fixtures cover errors and
+dedup cases absent from that real day. Input coverage is declared separately from
+the event timestamp; selected hours do not establish a complete day.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    source[GH Archive hourly gzip JSON Lines] --> ingest[Ingest: explicit nested schema]
-    ingest --> transform[Transform: quality, deduplication, UTC dimensions]
-    transform --> clean[Clean and rejected Parquet]
-    clean --> aggregate[Aggregate: counts and top-N rankings]
-    aggregate --> parquet[Date-partitioned metric Parquet]
-    parquet --> database[DuckDB: four metric tables]
-    parquet --> csv[CSV: actor and repository rankings]
+    archive[Hourly gzip JSON Lines] --> ingest[Ingest: explicit nested schema]
+    ingest --> checkpoint[Published ingested Parquet]
+    checkpoint --> transform[Transform: quality, dedup, UTC dimensions]
+    transform --> records[Published clean and rejected Parquet]
+    records --> aggregate[Aggregate: five metric datasets]
+    aggregate --> metrics[Published metric Parquet]
+    metrics --> database[DuckDB: five tables]
+    metrics --> csv[CSV: two rankings]
 ```
 
-Jobs are thin entrypoints. Reusable Spark logic lives in `github_analytics/`.
-The complete chain persists each stage; `ingest.py`, `transform.py`, and
-`aggregate.py` can also run independently, in that order.
-
-| Component | Role | Input → output |
+| Component | Role | Input -> output |
 | --- | --- | --- |
-| `scripts/acquire_archive.py` | Declare coverage, acquire and hash archives | GH Archive URLs → local gzip files and manifest |
-| `jobs/ingest.py` | Read explicit schema and normalize nested fields | Local gzip JSON Lines → ingested Parquet |
-| `jobs/transform.py` | Apply quality rules, deduplication and UTC dimensions | Ingested Parquet → clean and rejected Parquet |
-| `jobs/aggregate.py` | Compute daily volume, grouped counts and rankings | Clean Parquet → four metric datasets |
-| `jobs/pipeline.py` | Execute the same three stages in order | Local archives → all seven Parquet datasets |
-| `jobs/export.py` | Validate and export existing metrics | Metric Parquet → DuckDB tables and ranking CSV |
-| Verification scripts and tests | Check contracts and reconciliations | Generated fixtures or declared real input → assertions and reports |
+| `scripts/acquire_archive.py` | Declare hours, inspect/download and hash archives | GH Archive URLs -> gzip files and acquisition manifest |
+| `jobs/ingest.py` | Normalize with an explicit nested schema | Local gzip files -> ingested Parquet |
+| `jobs/transform.py` | Validate, deduplicate and derive UTC dimensions | Published ingested -> clean and rejected Parquet |
+| `jobs/aggregate.py` | Compute daily metrics and rejection breakdown | Published clean/rejected -> five metric datasets |
+| `jobs/pipeline.py` | Run the same stages, one date at a time | Local archives/checkpoints -> eight datasets |
+| `jobs/export.py` | Validate and export published metrics | Parquet -> five DuckDB tables and two CSV rankings |
+| `github_analytics/` | Reusable DataFrame logic, resource policy and storage protocol | Shared contracts used by thin jobs |
+| `scripts/` and `tests/` | Independent oracles and autonomous verification | Generated fixtures or declared archives -> assertions and reports |
+
+Every stage persists Parquet and the next stage reads that checkpoint. Aggregate
+can restart without ingest/transform or access to the raw archives.
 
 ## Repository structure
 
 ```text
 compose.yaml                 One-shot job and autonomous test services
-docker/spark/Dockerfile       Pinned-version Spark runtime and copied source
-requirements.txt             DuckDB dependency
-github_analytics/            Ingestion, transformation, aggregation, storage, exports
-jobs/                        pipeline.py, ingest.py, transform.py, aggregate.py, export.py
-scripts/                     Acquisition, independent oracles, comparisons, verification
-tests/                       Generated fixtures and autonomous unit/integration tests
-LICENSE                      MIT licence for this project's own code
+docker/spark/Dockerfile       Immutable base digest and copied application source
+requirements.txt             Pinned DuckDB dependency
+setup.bat / setup.ps1         Windows bootstrap and its PowerShell implementation
+setup.sh                     Bash bootstrap for macOS/Linux
+github_analytics/             Reusable ingestion, transformation, metrics and storage
+jobs/                         Thin pipeline, ingest, transform, aggregate, export CLIs
+scripts/                      Job wrappers, acquisition, recovery and verification
+tests/                        Autonomous generated-fixture tests
+LICENSE                       MIT licence for this project's own code
 ```
 
-Generated inputs, outputs and evidence are separate from source: `data/raw/`,
-`data/output/` and `data/test/` are ignored by Git. Their functional paths are
-listed below; real data and prior reports are not required to run the tests.
+`data/raw/`, `data/output/` and `data/test/` are generated, Git-ignored artifacts.
+`.gitignore` and `.dockerignore` exclude data, caches, environments, credentials
+and personal workflow configuration. Tests require no retained data or reports.
 
-## Data contract
+## Data contract and semantics
 
-Input is one event per line. The explicit schema extracts `id`, `type`,
-`created_at`, `repo.name`, `actor.login`, `org.login`, `payload.action`,
-`payload.pull_request.number` (falling back to `payload.number` for PR events),
-`payload.issue.number`, and ordered `payload.issue.labels[].name`.
-Additional payload fields are outside the projected contract.
+Input is one event per line (`multiLine=false`), matching GH Archive rather than
+the brief's multiline example. The schema projects `id`, `type`, `created_at`,
+`repo.name`, `actor.login`, `org.login`, `payload.action`, PR number (with
+`payload.number` fallback for PR events), issue number and ordered issue-label
+names. Extra payload fields are outside this contract.
 
-Normalized outputs retain `source_file`, source timestamp text, IDs, names,
-action, nested numbers, and label arrays. Parsed timestamps use UTC;
-`event_date` is a date partition, and `event_hour` is 0–23. Ingested and rejected
-records preserve `corrupt_record`; rejected records also contain a reason.
-Clean data adds `event_timestamp`, `event_hour`, `is_bot`, and `event_category`.
+Normalized records retain source timestamp text and `source_file`. IDs, type,
+repository and actor are trimmed. Parsed timestamps use UTC. Clean records add
+`event_timestamp` (timestamp), `event_hour` (integer 0-23), `is_bot` (boolean) and
+`event_category` (string). All datasets have `event_date` (date), represented in
+their partition path. Optional organization/payload fields may be null.
 
 | Accepted type | Category |
 | --- | --- |
@@ -81,358 +87,441 @@ Clean data adds `event_timestamp`, `event_hour`, `is_bot`, and `event_category`.
 | IssuesEvent | collaboration |
 | WatchEvent | passive |
 
-An actor is a bot when its login, converted to lowercase, ends with `[bot]`.
-This is a naming heuristic. Optional organization/payload fields may be null.
-Quality reasons have this precedence: corrupt JSON; missing/blank event ID,
-event type, repository, or actor; invalid timestamp; unsupported event type;
-UTC timestamp outside the requested date. Identity fields are trimmed.
+Quality precedence is: `corrupt_json`; missing/blank ID, type, repository or actor;
+`invalid_timestamp`; `unsupported_event_type`; `outside_date`; then dedup on
+quality-valid events. GH Archive groups by receipt hour: `outside_date` can be a
+normal receipt-time/`created_at` boundary mismatch, not corrupt JSON. Rejected
+records and their reason counts stay in the **requested processing date**.
 
-Deduplication applies only to quality-valid events, keyed by date and event ID.
-Identical normalized business contents retain the copy with the smallest source
-URI; remaining copies receive `duplicate_event_id`. Different contents reject
-**all** copies with `conflicting_event_id`. Business contents include the source
-timestamp text, parsed timestamp, ordered labels, and all normalized business
-fields; source provenance and unprojected payload fields are excluded from the
-conflict signature. Invalid copies retain their earlier quality reason.
+Dedup keys are `(event_date, event_id)`. Native Spark `xxhash64` hashes the business
+struct. For repeated IDs with equal hashes, exact JSON comparison preserves nulls,
+ordered arrays, timestamp text and parsed timestamp: a hash collision never proves
+equality. Different business contents reject **every copy** as
+`conflicting_event_id`; identical contents retain the smallest source URI and
+reject remaining copies as `duplicate_event_id`. Provenance and unprojected payload
+fields are excluded from the conflict signature. Invalid copies keep their
+earlier quality reason. Exact-row ties have indistinguishable projected contents.
+
+`is_bot` is exclusively a case-insensitive `[bot]` **suffix** test. This captures
+GitHub App naming and misses other bot names; it is not universal bot detection.
 
 | Dataset / DuckDB table | Grain and values |
 | --- | --- |
-| ingested | Every input event, normalized fields and provenance; Parquet only |
-| clean | One accepted event ID per date; Parquet only |
-| rejected | Every discarded event with reason; Parquet only |
-| daily_volume | Date; `event_count` (bigint) |
-| event_counts | Date, type, hour, bot flag; `event_count` (bigint) |
-| top_repositories | Date and repository; count and integer rank |
-| top_actors | Date and actor; count and integer rank |
+| `ingested` | Every projected input event and source URI; Parquet only |
+| `clean` | One accepted ID per date; Parquet only |
+| `rejected` | Every discarded occurrence, available ID/source URI, `corrupt_record` and reason; Parquet only |
+| `daily_volume` | Date; `event_count` bigint |
+| `event_counts` | Date, type, hour, bot flag; `event_count` bigint |
+| `top_repositories` | Date/repository; bigint count and integer rank |
+| `top_actors` | Date/actor; bigint count and integer rank |
+| `rejection_counts` | Processing date/reason; `event_count` bigint |
 
-Rankings default to 10 rows per date and sort by count descending, then entity
-name ascending. They count events, not unique contributors. CSV exports contain
-only the two ranking datasets, with headers and rank order. DuckDB exports all
-four metrics, with date-aware primary keys and validated schemas.
+Rankings default to ten entities per date, ordered by count descending then name
+ascending. Counts measure events, not unique people. The five metric tables have
+validated types and date-aware primary keys; only rankings are exported as CSV.
+For each processed date, `ingested = clean + rejected` and the sum of
+`rejection_counts.event_count` equals rejected rows. A zero-rejection date has no
+reason rows; an empty rerun replaces all eight datasets with typed empty output.
 
-## Runtime
-
-| Component | Version or configuration used |
-| --- | --- |
-| Spark base image | `spark:3.5.9-scala2.12-java17-python3-ubuntu` |
-| Python / PySpark | 3.10 / 3.5.9, supplied by the image |
-| Java | 17; 17.0.20.1 observed in job logs |
-| Py4J | Bundled with Spark, not independently installed |
-| DuckDB | 1.5.6, pinned in `requirements.txt` |
-| Spark execution | `local[2]`, UTC, Spark UI disabled |
-| SQL shuffle partitions | Default 2; validated full-day override 8 |
-
-The Dockerfile checks Python/PySpark/DuckDB versions. The image uses a version tag, not an
-immutable registry digest. Spark runs `local[2]`, with UTC and no Spark UI.
-The default SQL shuffle count is 2; explicit launcher `--conf` overrides it.
+**Traceability limit:** `rejection_counts` is aggregated. `rejected.source_file`
+and `event_id`, when present, permit searching retained raw archives, but there is
+no line number/offset or complete original JSON for valid JSON records. Missing
+or repeated IDs prevent guaranteed mapping to one original occurrence. Keep raw
+archives if investigation matters; normalized Parquet cannot reconstruct discarded
+payload fields. No additional lineage feature is implemented.
 
 ## Prerequisites and setup
 
-### Prerequisites
+| Component | Tested runtime |
+| --- | --- |
+| Base | `spark:3.5.9-scala2.12-java17-python3-ubuntu@sha256:0fd2f57b122301c9fd02988ba8d7d68f03fa6f680ba092a9e6249c92610bd2ed` |
+| Spark / Python | 3.5.9 / 3.10.12 |
+| Java / Hadoop | 17.0.20.1 / 3.3.4 |
+| DuckDB | 1.5.6, pinned in `requirements.txt` |
+| Default execution | `local[2]`, UTC, Spark UI disabled |
+| Identity | Windows default UID/GID `185:185` |
 
-- Git to obtain and inspect the source repository.
-- Docker Desktop using Linux containers, with Docker Compose v2 (`docker compose`).
-- Internet access for the initial image/dependency build and for GH Archive downloads.
-- Space for compressed input, generated Parquet/exports, Docker images and scratch,
-  and any retained verification rows or comparison snapshots. The validated day
-  required 2,215,022,601 compressed input bytes; this is an observation, not a
-  minimum disk requirement. Inspect the acquisition plan and available space
-  before downloading, and allow for additional verification copies.
+Install Git and Docker with Linux containers and Compose v2. Initial builds and
+archive downloads need internet access. No host Python, Java, virtual environment,
+credentials or cloud service is required. Reserve space for compressed input,
+Parquet, exports, retained generations, images and oracle output/scratch: the
+validated day alone has 2,215,022,601 compressed input bytes, not a total disk
+requirement.
 
-No host Python, Java, virtual environment, credentials, or cloud service is needed.
-The tested environment is Windows PowerShell with Linux containers on Windows/WSL2.
-Docker Desktop and Compose host versions are not pinned; native macOS/Linux hosts
-have not been tested.
-The setup scripts were exercised from Windows PowerShell and Ubuntu WSL Bash
-against Docker Desktop (Bash used a verification-only Windows CLI path bridge
-because distro integration was disabled). Linux filesystem permissions were
-checked separately on an isolated container volume. This does not establish
-native macOS/Linux Docker behavior. A fresh anonymous clone was checked
-separately after publication.
-
-### Getting started from a checkout
-
-The public repository is [batch-processing-spark](https://github.com/Davideco89/batch-processing-spark).
-A fresh anonymous clone was verified after publication. From the directory
-where you want the checkout, Windows PowerShell:
+Windows PowerShell, from the desired parent directory:
 
 ```powershell
 git clone https://github.com/Davideco89/batch-processing-spark.git
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\batch-processing-spark\scripts\setup.ps1
-```
-
-The explicit process-level execution policy lets the setup script run on Windows
-hosts that otherwise block local PowerShell scripts; it does not change the
-machine's persistent policy.
-
-From the directory where you want the checkout, macOS/Linux Bash:
-
-```bash
-git clone https://github.com/Davideco89/batch-processing-spark.git
-bash ./batch-processing-spark/scripts/setup.sh
-```
-
-The setup checks below were run on local checkouts, a sanitized candidate,
-and the published GitHub clone on Windows PowerShell with Linux Docker containers.
-
-Both scripts locate the repository, validate Compose, build the runtime, probe
-write access to the data bind, run autonomous tests, and verify the essential
-pipeline/export CLIs using generated temporary input. They do not download
-archives or overwrite existing datasets. Setup is safe to repeat; each run
-rebuilds and reruns these checks. No persistent container is created.
-
-On Unix hosts, Bash creates an ignored `.env` only if absent, using the current
-non-root host `LOCAL_UID`/`LOCAL_GID`. These Compose values also register the
-matching Spark account during the image build, so Java can resolve its identity.
-Windows defaults remain `185:185`; PowerShell does not create `.env`.
-`.env.example` documents the two optional values. Existing `.env` files are
-never rewritten; shell overrides are supported. Rebuild after changing identity
-values. Setup does not change permissions or ownership of existing data; a
-successful root-directory probe does not certify ownership of older subdirectories.
-
-For manual build and tests, from the checkout's parent directory:
-
-```powershell
+.\batch-processing-spark\setup.bat
 Set-Location batch-processing-spark
-docker compose build
-docker compose run --rm test
 ```
 
-The equivalent setup for macOS/Linux Bash is documented, but untested on those hosts:
+macOS/Linux Bash instructions:
 
 ```bash
+git clone https://github.com/Davideco89/batch-processing-spark.git
+bash ./batch-processing-spark/setup.sh
 cd batch-processing-spark
-docker compose build
-docker compose run --rm test
 ```
 
-These commands build the copied-source runtime and run autonomous fixture tests.
-Then declare and acquire the desired real input and execute the jobs below.
-Job configuration uses non-secret CLI flags. An ignored `.env` is optional for
-the Docker runtime identity; no credentials are required.
+Setup validates Compose, builds, probes bind write access, runs autonomous tests
+and verifies essential CLIs on fresh temporary input. It does not download data
+or overwrite existing outputs. Repeat setup to rebuild copied source and recheck.
+The PowerShell execution-policy override is process-scoped, not persistent.
+`setup.bat` delegates to the sibling `setup.ps1` and returns a nonzero exit code
+when setup fails. PowerShell can also be invoked directly:
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1` from the
+repository root. All setup entrypoints resolve the repository from their own
+location, including paths with spaces; job wrappers remain under `scripts/`.
 
-### Input and output paths
+Bash creates an ignored `.env` only when absent, with a non-root host
+`LOCAL_UID`/`LOCAL_GID`. `.env.example` documents these optional values; existing
+files are preserved. The image registers the matching Spark account. Rebuild
+after changing identity; setup does not change ownership of old data. A successful
+root-directory probe does not certify older subdirectories.
 
-| Purpose | Container path | Host path |
-| --- | --- | --- |
-| Real archives | `/data/raw/gharchive` | `data/raw/gharchive/` |
-| Parquet | `/data/output/parquet/github-events` | `data/output/parquet/github-events/` |
-| DuckDB | `/data/output/duckdb/github-events.duckdb` | `data/output/duckdb/github-events.duckdb` |
-| CSV | `/data/output/csv/github-events` | `data/output/csv/github-events/` |
-| Verification, logs, temporary experiments | `/data/test` | `data/test/` |
-
-Compose mounts `./data:/data` for the job service, so host data persists between
-runs. `docker compose run --rm` removes finished containers and their `/tmp`
-scratch. Source is copied into images: rebuild when code changes. Tests generate
-data in temporary directories and do not mount or require host data. `.gitignore`
-and `.dockerignore` exclude generated data, caches, environments, secrets, and
-personal workflow configuration. Published
-`main` has a single root commit without those personal files; the earlier
-project history remains in local refs only.
+Tested: Windows PowerShell, Docker Desktop Linux/amd64 on Windows/WSL2, and Ubuntu
+WSL Bash with a verification-only bridge to the Windows Docker CLI. The latter
+exercised the public Bash wrapper but does not certify a native Linux/macOS Docker
+host. ARM, standalone clusters, native Windows Spark, object/network storage and
+host/VM power loss are untested. The older isolated ext4 evidence has placeholders
+in some recorded invocations; those exact commands were not retroactively invented.
 
 ## Run the pipeline
 
-### Windows PowerShell
-
-These command forms were tested from Windows PowerShell with Linux containers.
-The full-day execution used a 2 GiB driver and 8 shuffle partitions.
+Compose mounts `./data:/data`; files persist after the container exits. Source is
+copied into the image, so rebuild after changes:
 
 ```powershell
 docker compose build
 docker compose run --rm test
 ```
 
-Inspect the selected source sizes **before downloading**. The acquisition helper
-requires ordered, unique hours, defaults to a 128 MiB limit per file and a 3 GiB
-total limit, records URLs/actual sizes/SHA256, and reuses completed size-matching
-files. Interrupted partial transfers restart; completed hours do not redownload.
-The manifest provides the observed content hashes; a size check alone is not a
-remote content-authenticity guarantee.
+These single-line Docker commands also work in Bash. Default raw is
+`/data/raw/gharchive`; default Parquet is `/data/output/parquet/github-events`;
+default DuckDB and CSV are `/data/output/duckdb/github-events.duckdb` and
+`/data/output/csv/github-events`. Destination defaults are independent. The
+examples below use a separate published root to preserve older direct-write data.
+
+Declare coverage and inspect sizes **before downloading**:
 
 ```powershell
 docker compose run --rm --entrypoint python3 job /app/scripts/acquire_archive.py --date 2025-06-02 --hours 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 --head-only --manifest /data/test/gharchive/2025-06-02/plan.json
-# Inspect plan.json and available disk space, then acquire the declared full hours.
+# Inspect the plan and free disk space before acquisition.
 docker compose run --rm --entrypoint python3 job /app/scripts/acquire_archive.py --date 2025-06-02 --hours 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 --plan /data/test/gharchive/2025-06-02/plan.json --manifest /data/test/gharchive/2025-06-02/acquisition.json
-docker compose run --rm job --driver-memory 2g --conf spark.sql.shuffle.partitions=8 /app/jobs/pipeline.py --date 2025-06-02
-docker compose run --rm --entrypoint python3 job /app/jobs/export.py --date 2025-06-02
+docker compose run --rm job --driver-memory 2g /app/jobs/pipeline.py --date 2025-06-02 --output-root /data/output/parquet/github-events-published
+docker compose run --rm --entrypoint python3 job /app/jobs/export.py --date 2025-06-02 --parquet-root /data/output/parquet/github-events-published --database /data/output/duckdb/github-events-published.duckdb --csv-root /data/output/csv/github-events-published
 ```
 
-The acquisition CLI without arguments selects only June1 hour00. The Spark job
-requires `--date` and reads all matching files already in its raw root; it does
-not download files or enforce a 24-hour day. Verify the manifest/file inventory
-before interpreting a metric as a full-day result.
+Acquisition has 128 MiB/file and 3 GiB/total default limits; it records actual
+sizes/SHA256 and reuses completed size-matching files. Partial transfers restart.
+A size check alone does not authenticate remote contents. Jobs read all matching
+local files without downloading or enforcing 24-hour coverage; inspect the
+acquisition manifest and verify its hashes before interpreting full-day totals.
+The 2026-10-02 validation reused existing archives and downloaded none.
 
-The separately validated full-day stage commands below use an isolated output
-root and the exact observed launcher flags (the original runs effectively used 2
-before the session fix described below). Stages support `--raw-root`,
-`--output-root`, and `--top-n` (positive integer):
+Public stage wrappers invoke Docker and `spark-submit`. Bash:
+
+```bash
+./scripts/run_job.sh ingest --date=2025-06-02 --output-root=/data/output/parquet/github-events-published
+./scripts/run_job.sh transform --date=2025-06-02 --output-root=/data/output/parquet/github-events-published
+./scripts/run_job.sh aggregate --date=2025-06-02 --output-root=/data/output/parquet/github-events-published
+```
+
+PowerShell equivalents:
 
 ```powershell
-docker compose run --rm job --driver-memory 2g --conf spark.sql.shuffle.partitions=8 /app/jobs/ingest.py --date 2025-06-02 --output-root /data/test/github-events/2025-06-02/day/separate/parquet
-docker compose run --rm job --driver-memory 2g --conf spark.sql.shuffle.partitions=8 /app/jobs/transform.py --date 2025-06-02 --output-root /data/test/github-events/2025-06-02/day/separate/parquet
-docker compose run --rm job --driver-memory 2g --conf spark.sql.shuffle.partitions=8 /app/jobs/aggregate.py --date 2025-06-02 --output-root /data/test/github-events/2025-06-02/day/separate/parquet
+.\scripts\run_job.ps1 ingest --date=2025-06-02 --output-root=/data/output/parquet/github-events-published
+.\scripts\run_job.ps1 transform --date=2025-06-02 --output-root=/data/output/parquet/github-events-published
+.\scripts\run_job.ps1 aggregate --date=2025-06-02 --output-root=/data/output/parquet/github-events-published
 ```
 
-Exporter `--mode` is `both` by default, or `csv`/`duckdb`. It supports
-`--parquet-root`, `--csv-root`, and `--database`; destination defaults are
-independent, so supply destination overrides when using a separate test dataset.
+Use process-scoped `powershell.exe -NoProfile -ExecutionPolicy Bypass -File`
+if the local policy blocks script execution. Direct Docker entrypoints remain
+available. `--raw-root`, `--output-root` and positive `--top-n` apply to the jobs.
+The exporter supports `--mode both|duckdb|csv` and the three destination overrides
+shown above; it exports one date per invocation.
 
-### macOS / Linux Bash
+Date ranges are inclusive and sequential. Supply either `--date` or both
+`--start-date` and `--end-date`; invalid/reversed/mixed dates fail before Spark.
+The first failing date stops the loop. Resume explicitly after inspection:
 
-Use the same single-line Compose commands above from the project root in Bash.
-No PowerShell-specific syntax is needed in those invocations. Native macOS and
-Linux hosts were **not** tested; Linux container execution on Windows was tested.
-A fresh anonymous Git clone was verified; CI and native-host behavior remain
-untested.
+```powershell
+.\scripts\run_job.ps1 pipeline --start-date=2025-06-01 --end-date=2025-06-03 --resume-date=2025-06-02 --from-stage=aggregate --output-root=/data/output/parquet/github-events-published
+```
+
+This resumes aggregate on June2, then executes the full chain on June3. Individual
+stage jobs run their chosen stage for each selected date. Aggregate requires both
+clean and rejected checkpoints; transform requires ingested. Recover interrupted
+publication first as described below. Range fixtures and recovery were tested;
+the example range requires its own local inputs/checkpoints.
+
+### Resources, shuffle and layout
+
+The launcher validates `--master`, `--driver-memory`, `--executor-memory`,
+`--executor-cores`, `--total-executor-cores` and repeatable `--conf key=value` before
+the driver starts. Dedicated resource flags override matching `--conf`, then
+`SPARK_MASTER`, `SPARK_DRIVER_MEMORY`, `SPARK_EXECUTOR_MEMORY`,
+`SPARK_EXECUTOR_CORES`, `SPARK_TOTAL_EXECUTOR_CORES`, then defaults. It is a defined
+subset of `spark-submit`, not forwarding every native option.
+
+```powershell
+docker compose run --rm job --master 'local[4]' --driver-memory 768m --executor-memory 768m --conf spark.sql.shuffle.partitions=8 /app/jobs/pipeline.py --date 2025-06-02 --output-root /data/output/parquet/github-events-published
+```
+
+This resource form was tested on small range fixtures, not as a recommendation
+for the full day. Local mode has no separately allocated executor JVM: requesting
+768m produced a 768 MiB driver heap while its effective executor context remained
+1g. Cluster resource allocation has not been verified.
+
+Shuffle precedence is application `--shuffle-partitions`, launcher
+`--conf spark.sql.shuffle.partitions=N` (or `SPARK_SHUFFLE_PARTITIONS` if absent),
+distinguishable session override, then per-stage footer-volume policy. A session
+override equal to the last automatic value is ambiguous; prefer explicit CLI
+flags. Automatic count is `max(2, ceil(estimated_bytes / target_bytes))`, default
+target 128 MiB; `--shuffle-target-bytes` changes the positive target. Transform
+uses ingested Parquet footer uncompressed column bytes; aggregate uses clean plus
+rejected. Ingest reports compressed gzip bytes without a shuffle-volume estimate.
+
+`StageSettings` records inputs, estimate, actual shuffle, heap/master and AQE.
+Footer bytes are a **proxy**, distinct from gzip size, memory and compressed
+shuffle transport. AQE is preserved; its observed advisory target was 64 MiB,
+separate from the 128 MiB initial-policy target. Neither guarantees task sizes.
+Hourly gzip files stay separate and nonsplittable; `local[2]` runs two tasks at a
+time. Increasing cores or selecting a real master does not certify cluster
+publication: this local filesystem protocol requires shared paths visible to
+driver and workers. No cosmetic `repartition`/`coalesce` was added.
+
+## Published storage, recovery and reproducibility
+
+Publication is per dataset/date, with an exclusive writer/recovery lock:
+
+1. Write staging under `dataset/_transactions/YYYY-MM-DD/stage` on the same
+   filesystem. Validate schema, row count, `_SUCCESS` and file inventory/SHA256.
+2. Rename the completed directory to
+   `dataset/event_date=YYYY-MM-DD/_generations/<uuid>`; generations are immutable.
+3. Atomically replace the small `_publication.json` pointer with `os.replace`,
+   then remove the transaction journal. Old generations are retained.
+
+First publication creates the first pointer. Replacement creates a new generation
+and changes the pointer, **not delete-plus-rename of a nonempty directory**. Empty
+dates publish schema-carrying empty Parquet generations. This is not a transaction
+across eight datasets or across Parquet, DuckDB and CSV. DuckDB replaces five
+tables for the date in its own transaction; CSV replacement is per file.
+
+Normal consumers resolve the pointer and validate journal absence, manifest,
+completion, inventory and content hashes. Use `github_analytics.storage.read_date`
+or `read_dates`, the exporter and supplied verifiers. A dataset-root Parquet glob
+bypasses these gates and is not a supported reader. A lazy Spark reader retains
+the resolved immutable generation, so old generations must not be deleted while
+readers may still use them.
+
+After an interrupted writer, readers fail closed even if the new pointer already
+exists. Stop the writer and inspect its date before recovery:
+
+```powershell
+docker compose run --rm --entrypoint python3 job /app/scripts/recover_partition.py --dataset-root /data/output/parquet/github-events-published/daily_volume --date 2025-06-02 --action inspect
+docker compose run --rm --entrypoint python3 job /app/scripts/recover_partition.py --dataset-root /data/output/parquet/github-events-published/daily_volume --date 2025-06-02 --action rollback
+```
+
+Inspect fails on incomplete publication; preserve the error/journal for diagnosis.
+Rollback retains the previous complete pointer before publication, or removes
+unready staging if no prior output exists. If pointer replacement already
+committed, recovery completes cleanup instead of undoing it. Explicit `--action
+commit` accepts only a validated prepared generation. Corrupt or ambiguous
+metadata fails rather than being guessed. Recovery cannot take an active writer's
+lock. Recover each affected dataset/date, restart the required stage and reexport
+before consumption. Tests include recovery followed by aggregate without raw.
+
+Legacy direct-write partitions are rejected and left intact. Regenerate retained
+raw into an unused published output root; no automatic import/attestation exists.
+`compare_legacy.py` is an explicit **read-only diagnostic** comparing seven legacy
+schemas/full-row multisets to current publication. It bypasses the gate only for
+that restricted legacy comparison and never certifies legacy data as published.
+The old single-archive `compare_layout.py` CLI is retired in favor of this tool
+and `validate_parquet.py`.
+
+Streaming hash checks and footer discovery add I/O; retained generations consume
+disk. Safe garbage collection, automatic retry, concurrent writers, coordinated
+rollback/backup, scheduler and CI are not implemented. Do not manually delete
+locks, journals or generations during active reads/writes. Same-date reruns
+replace only that date, preserve other dates and retain logical rows for unchanged
+input; compare full rows/types, not filenames or physical Parquet bytes.
 
 ## Validation and observed results
 
-The final Docker suite passed all 22 tests in 81.234 seconds. It generates
-malformed/valid/nested events, duplicates and
-conflicts, checks timestamps, metric grains/ranks, empty reruns, date preservation,
-exports and schema rejection. Tests never download archives or call external APIs.
-A separate fresh-state check runs essential CLIs against self-generated temporary
-input and asserts that launcher shuffle overrides are honored:
+| Check | Command or query | Observed result | Date / environment |
+| --- | --- | --- | --- |
+| Complete autonomous suite | `docker compose run --rm test` | 46 tests, 366.833 s, OK; no downloads/inherited output | 2026-10-02, Windows/WSL2 Linux Docker |
+| Fresh public clone with candidate source overlay (historical setup path) | `scripts/setup.ps1` | Build, identity/write probe, 41 then-current tests and fresh pipeline/export/verifier passed; final two helper/test files checked separately | 2026-10-02, Windows PowerShell; candidate changes not yet published |
+| Public wrappers and stage restart | Bash ingest; PowerShell transform/aggregate | Fixture 13 = 8 clean + 5 rejected; later stages used absent raw paths | 2026-10-02, Windows/Ubuntu WSL bridge |
+| Range, failure/resume, empty and other dates | `check_batch_scaling.py --skip-volume` on isolated generated input | Invalid dates/resources rejected; failed middle date stopped loop; explicit resume passed; eight typed empties, coherent empty SQL/CSV, 116 other-date file hashes unchanged | 2026-10-02, actual Windows bind |
+| Storage fault matrix | `tests.test_storage` and `tests.test_publication` with bind-backed `TMPDIR` | 7 tests OK; 33 publication fault scenarios for first/replacement/empty dates | 2026-10-02, actual Windows bind |
+| Real process interruption | Isolated writer killed during nonempty temporary files and after pointer replacement | Exit137, no OOM; seven consumers rejected both interrupted outputs; recovery/restart/export passed, 50 other-date files unchanged | 2026-10-02, actual Windows bind |
+| Actual read-only bind | Normal Spark readers and read-only DuckDB query | All eight real-day counts and five tables readable; attempted bind write failed errno30 | 2026-10-02, final candidate |
+| Historical real-day regression | `compare_legacy.py` | Seven schemas and complete row multisets matched without source-URI rewriting or legacy attestation | 2026-10-02, preserved original baseline |
+| Independent real-day validation | `stream_oracle.py` + `validate_parquet.py` | Eight schemas/full-row multisets matched raw oracle and native shuffle 8; all 24 archive hashes/coverage verified | 2026-10-02, full day |
+| Analytical exports | `verify_exports.py` | Five SQL table types/full rows and two CSV headers/ordered contents matched published metrics | 2026-10-02, full day |
+
+Final runtime attribution is retained locally: the 46-test candidate differs from
+the real-day image only in the bounded sample profiler and its new tests; all
+pipeline/business/schema code is identical. An actual fixture profiler run and
+read-only real consumers also passed on the final image. Earlier suite/clone
+results are not retroactively attributed to the final image.
+
+Run the fresh autonomous CLI check independently:
 
 ```powershell
 docker compose run --rm --entrypoint python3 job /app/scripts/check_reproducibility.py
 ```
 
-For a complete real-data check, the independent oracle streams all raw events and
-uses disk-backed SQLite grouping with bounded caches and batched transactions.
-Disposable random-I/O scratch lives inside the container, avoiding Windows-bind
-SQLite overhead. Complete expected rows and the source-hash report persist on
-`/data/test`; Spark compares every field and multiplicity in both directions with
-`exceptAll`, rather than collecting millions of rows in Python.
+For a complete day, the independent oracle streams raw events with disk-backed
+SQLite grouping and bounded caches/batched transactions. Random-I/O scratch uses
+container `/tmp`; complete expected rows and hashes persist at the destination.
+Spark compares every field and multiplicity with bidirectional `exceptAll`,
+without collecting the day into Python:
 
 ```powershell
-docker compose run --rm --entrypoint python3 job /app/scripts/stream_oracle.py --date 2025-06-02 --destination /data/test/github-events/2025-06-02/day/oracle
-docker compose run --rm job --driver-memory 2g --conf spark.sql.shuffle.partitions=8 /app/scripts/validate_parquet.py --date 2025-06-02 --oracle /data/test/github-events/2025-06-02/day/oracle --manifest /data/test/gharchive/2025-06-02/acquisition.json --report /data/test/github-events/2025-06-02/day/parquet.json
-docker compose run --rm --entrypoint python3 job /app/scripts/verify_exports.py --date 2025-06-02 --report /data/test/github-events/2025-06-02/day/exports.json
+docker compose run --rm --entrypoint python3 job /app/scripts/stream_oracle.py --date 2025-06-02 --destination /data/test/real-validation/2025-06-02/oracle
+docker compose run --rm job --driver-memory 2g --conf spark.sql.shuffle.partitions=8 /app/scripts/validate_parquet.py --date 2025-06-02 --output-root /data/output/parquet/github-events-published --oracle /data/test/real-validation/2025-06-02/oracle --manifest /data/test/gharchive/2025-06-02/acquisition.json --report /data/test/real-validation/2025-06-02/parquet.json
+docker compose run --rm --entrypoint python3 job /app/scripts/verify_exports.py --date 2025-06-02 --parquet-root /data/output/parquet/github-events-published --database /data/output/duckdb/github-events-published.duckdb --csv-root /data/output/csv/github-events-published --report /data/test/real-validation/2025-06-02/exports.json
 ```
 
-The following are previously observed checks, not new executions performed for
-this documentation correction. Full invocations are above and in the retained
-`executed-commands.ps1`; comparison rows identify the actual historical reports.
-Script arguments in the table use the Compose launchers shown above:
-`validate_parquet.py` runs through `job --driver-memory 2g --conf spark.sql.shuffle.partitions=8`
-with its `/app/scripts/` path; `verify_exports.py` uses the Python entrypoint.
-Historical baseline snapshots and reports are local evidence, not committed
-inputs: retain your own baseline before rerunning and supply its paths to repeat
-these comparisons. The standalone commands above create new reports without
-requiring the historical baseline.
+Retain a separate published baseline and use `validate_parquet.py --compare-root`
+for rerun/full-row equality. Reexport, then `verify_exports.py --compare
+<previous-report.json>` checks SQL rows/types and CSV bytes, including other dates.
+`profile_archive.py` is only a small-sample diagnostic: default limits are 200,000
+raw/frame rows and 128 MiB original uncompressed input/serialized frame bytes.
+It refuses larger samples before driver materialization. These caps are not a
+memory guarantee; use the streaming oracle for full days.
 
-| Check | Command or query | Observed result | Date / environment |
-| --- | --- | --- | --- |
-| Autonomous fixture tests | `docker compose run --rm test` | 22 tests, 81.234 s, OK; no downloads or inherited output | 2026-09-29, Windows PowerShell / Linux Docker |
-| Fresh generated state and launcher configuration | `docker compose run --rm --entrypoint python3 job /app/scripts/check_reproducibility.py` | Pipeline/export/verifier CLIs passed; effective shuffle 8 asserted | 2026-09-29, same Docker runtime |
-| Full-day schema, quality and source coverage | `validate_parquet.py --date 2025-06-02 --oracle /data/test/github-events/2025-06-02/day/oracle --manifest /data/test/github-events/2025-06-02/day/acquisition.json --compare-root /data/test/github-events/2025-06-02/day/baseline/parquet --report /data/test/github-events/2025-06-02/day/final-validation.json` | All seven schemas/full-row multisets matched oracle and baseline; 24 source hashes matched; unique IDs and critical null checks passed | 2026-09-29, report `final-validation.json` |
-| Separate stages | `validate_parquet.py --date 2025-06-02 --output-root /data/test/github-events/2025-06-02/day/separate/parquet --compare-root /data/test/github-events/2025-06-02/day/baseline/parquet --report /data/test/github-events/2025-06-02/day/separate-comparison.json` | All seven logical datasets unchanged | 2026-09-29, `separate-comparison.json` |
-| Same-date rerun | `validate_parquet.py --date 2025-06-02 --compare-root /data/test/github-events/2025-06-02/day/baseline/parquet --report /data/test/github-events/2025-06-02/day/rerun-comparison.json` | All seven logical datasets unchanged; final-validation comparison also matched effective shuffle 8 against original 2 | 2026-09-29, `rerun-comparison.json` and `final-validation.json` |
-| DuckDB and CSV rerun | `verify_exports.py --date 2025-06-02 --compare /data/test/github-events/2025-06-02/day/exports-baseline.json --report /data/test/github-events/2025-06-02/day/exports-final.json` | SQL rows/types and CSV bytes unchanged, including other dates | 2026-09-29, `exports-final.json` |
-| Previously existing date and evidence | Recorded file-hash comparison plus SQL/CSV verification | 293 preexisting file hashes preserved; June1 SQL rows and CSV bytes unchanged | 2026-09-29, `previous-date-preservation.json` and `orchestrator-preservation.json` |
+### Real-day counts and layout
 
-For rerun proof, retain a separate Parquet snapshot and pass it with
-`validate_parquet.py --compare-root`. Reexport, then use
-`verify_exports.py --compare <previous-report.json>` for SQL full-row/type hashes
-and CSV byte equality, including other dates. The older `profile_archive.py`
-in-memory verifier is suitable for small samples; use the streaming oracle for days.
+Source: `https://data.gharchive.org/2025-06-02-{hour}.json.gz`, all hours 0-23.
+The 24 retained archives total 2,215,022,601 compressed bytes. Complete input
+reconciliation is **3,671,908 = 2,673,289 accepted + 998,619 rejected**, all
+`unsupported_event_type`. No real quality-invalid rows, identical duplicates or
+conflicting IDs were observed; generated tests cover those cases, including forced
+hash collisions, UTC/offset boundaries, multiple defects and bot suffix cases.
 
-### Observed real-data results (2026-09-29)
+| Dataset | Rows | Automatic Parquet files / bytes |
+| --- | ---: | ---: |
+| ingested | 3,671,908 | 24 / 116,595,191 |
+| clean | 2,673,289 | 2 / 102,783,152 |
+| rejected | 998,619 | 3 / 36,004,131 |
+| event_counts | 168 | 1 / 2,377 |
+| daily_volume | 1 | 1 / 499 |
+| top_repositories | 10 | 1 / 1,405 |
+| top_actors | 10 | 1 / 1,274 |
+| rejection_counts | 1 | 1 / 895 |
 
-| Coverage | Compressed input bytes | Ingested | Clean | Rejected |
-| --- | ---: | ---: | ---: | ---: |
-| June1, hour00 only | 63,874,867 | 126,670 | 97,999 | 28,671 |
-| June2, all 24 UTC hours | 2,215,022,601 | 3,671,908 | 2,673,289 | 998,619 |
+The transform footer proxy was 185,568,399 bytes and selected 2; aggregate's proxy
+was 257,768,512 bytes and selected 2. Explicit shuffle 8 produced eight clean files
+/115,380,062 bytes, matching the historical eight-file physical-size baseline;
+all logical rows match automatic 2 exactly. No extra layout shuffle was introduced.
 
-June2 source URLs are `https://data.gharchive.org/2025-06-02-{hour}.json.gz`,
-with hours 0–23. No row truncation was used. Raw timestamps ranged from
-00:00:00 to 23:59:58 UTC. All rejects were unsupported event types; no real-data
-quality-invalid, identical-duplicate, or conflicting-ID events were observed.
-Those rules are exercised by generated tests.
+Real automatic-chain event logs contain 209 tasks and 37 final AQE plans;
+the explicit 8 transform/aggregate restart has 154 tasks and 33 final AQE plans.
+Largest observed compressed task shuffle reads were 106,177,612 and 27,657,411
+bytes respectively; shuffle writes were 103,179,894 and 107,531,442 bytes.
+Both show coalesced AQE reads and conditional exact-JSON hash fallback. The second
+run excludes ingest, and CPU/resource contention differed: these are observations,
+not a controlled speed comparison or a guarantee for larger days.
 
-The four June2 metrics contain 168 type/hour/bot groups, 1 daily row, 10 repository
-ranks, and 10 actor ranks. Both volume sums reconcile to 2,673,289 clean events.
-Complete oracle comparisons passed for all seven Parquet schemas/row multisets,
-including nested fields and provenance; clean IDs were unique and nine critical
-fields had zero nulls. Separate stages, a same-date rerun, and an effective
-shuffle 8 run matched the original shuffle 2 baseline exactly in logical contents.
-DuckDB rows/types and CSV bytes matched reruns; June1 output and archived evidence
-were preserved (293 preexisting file hashes, plus June1 SQL logical rows).
+The retained synthetic dedup benchmark used the same 150,000-row input/runtime,
+warmup excluded and three measurements. Native hash reduced CPU/shuffle bytes,
+but median wall time at shuffle 8 increased **36.8%**; at shuffle 2 it decreased
+13.3%. There is no universal acceleration claim or real week/month forecast.
 
-The corrected shuffle 8 chain took 251.594s; complete distributed comparison
-291.689s; independent oracle 1216.833s; acquisition 119.391s. These are local
-observations, not benchmark guarantees. Earlier concurrent runs had much larger
-host stopwatch values, retained in evidence without an inferred cause.
-An initial session-setting defect overrode explicit shuffle 8 with2; it was fixed,
-verified in a fresh process, and the full day was rerun with actual 8.
-Two slower SQLite-on-bind oracle attempts were intentionally stopped and retained
-as failed attempts before the successful container-scratch run.
+### Inspect five rejection rows in the terminal
 
-Final ingested Parquet has 24 files (~116.6 MB), clean 8 files (~115.4 MB), rejected 3
-files (~36.0 MB), and each small metric one file. Baseline clean 2 files were
-~102.8 MB; both layouts contain identical rows. No extra `repartition` or forced
-single-file `coalesce` was added: the observed layouts are manageable, and eight
-clean files are not a demonstrated improvement in compression or performance.
-Exact manifests, commands, timings, failed attempts and reports remain locally
-under `data/test/github-events/2025-06-02/day/`, ignored by Git. Reproduce them
-with the supplied scripts; generated evidence is not a repository dependency.
+PowerShell, after the export above:
 
-## Operations and reproducibility
+```powershell
+@'
+import duckdb
+with duckdb.connect("/data/output/duckdb/github-events-published.duckdb", read_only=True) as db:
+    print("Tables:", db.execute("SHOW TABLES").fetchall())
+    print("Schema:", db.execute("DESCRIBE rejection_counts").fetchall())
+    print("First five:", db.execute("SELECT * FROM rejection_counts ORDER BY event_date, rejection_reason LIMIT 5").fetchall())
+'@ | docker compose run --rm -T --entrypoint python3 job -
+```
 
-A successful single-writer rerun replaces only the requested date in each
-Parquet dataset, including an empty date, and leaves other dates intact.
-Deterministic deduplication and ranking preserve logical results for identical
-input. Parquet filenames/bytes can change, so compare full logical rows and types.
-DuckDB replaces all four metrics for one date in a transaction; CSV replacement
-is atomic per file. The entire chain and combined DB/CSV export are not a single
-transaction. Successful same-date reruns were tested; after an interruption,
-rerun the complete chain and exports and repeat validation before consuming the
-results. This is operational guidance, not a tested crash-recovery guarantee.
-Concurrent writers and coordinated rollback are unsupported.
+Bash equivalent:
 
-Jobs print runtime settings and stage counts to stdout/stderr; acquisition and
-verification helpers write the explicitly selected manifests/reports. Retain logs
-and a separate baseline when verifying reruns. No scheduler, automatic retry,
-coordinated backup/rollback, or CI is implemented. Run dates and archive
-coverage are selected explicitly.
+```bash
+docker compose run --rm -T --entrypoint python3 job - <<'PY'
+import duckdb
+with duckdb.connect("/data/output/duckdb/github-events-published.duckdb", read_only=True) as db:
+    print(db.execute("SELECT * FROM rejection_counts ORDER BY event_date, rejection_reason LIMIT 5").fetchall())
+PY
+```
+
+For the verified day the result has **one** row: date 2025-06-02,
+`unsupported_event_type`, count 998619. `LIMIT 5` returns at most five existing
+reason/date groups, not five rejected messages. Use the published `rejected`
+dataset for projected occurrences and retained raw for source investigation.
 
 ## Implementation decisions and deviations
 
 | Brief or reference | Choice | Reason / trade-off | Verification |
 | --- | --- | --- | --- |
-| Brief suggests multiline JSON | `multiLine=false` with an explicit nested schema | GH Archive contains one JSON event per line; extra payload fields are outside the contract | [Official crawler](https://github.com/igrigorik/gharchive.org/blob/master/crawler/crawler.rb), complete hourly and full-day raw/oracle reconciliation |
-| Bash wrapper and YAML job configuration examples | Compose wraps `spark-submit`; typed CLI flags supply dates and paths | Windows execution without host Bash/Java/Python; no additional configuration layer | PowerShell chain, separate stages and fresh generated-state CLI check passed |
-| Optional schema/tests/dedup/DuckDB/CSV | Adopt all five as deliverables | Explicit contract, reproducible correctness checks and local analytical consumption; additional maintenance | Autonomous fixtures, full-row oracle checks, SQL/CSV reconciliation and reruns |
-| Optional repartition by date | Date-partitioned writes, without an extra repartition or forced single-file coalesce | One requested date per run; measured layouts are manageable, with no demonstrated benefit from extra shuffling | Final clean 8 files and baseline 2 files have identical logical rows; sizes recorded in observed results |
-| Repeatable date processing | Deterministic dedup/ranking, per-date replacement, DuckDB transaction and atomic individual CSV files | Preserves other dates; whole-chain atomicity and concurrent writers remain unsupported | Same-date reruns, empty-date fixtures and prior-date preservation checks |
-| Full-data verification on Windows | Independent streaming oracle with SQLite scratch in container `/tmp` | Avoids observed random-I/O overhead on Windows bind; disposable state is rebuilt after interruption | Two bind attempts stopped; complete scratch-backed oracle and exact Spark comparison passed |
+| Multiline JSON example | Explicit nested schema, JSON Lines | GH Archive is one event per line; unprojected payload is not recoverable | Complete raw/oracle reconciliation and nested fixtures |
+| Bash/YAML execution examples | Bash and PowerShell wrappers, Compose, validated CLI | No host Python/Java; no extra configuration layer | Actual public wrapper stages and fresh checkout setup |
+| Scale across dates | Sequential daily loop, explicit resume/resources | Preserves hourly gzip and checkpoint boundaries; no cluster certification | Three-date failure/resume fixture and full-day run |
+| Volume-based shuffle | Footer proxy with explicit override and actual settings/plans | Additional footer I/O; approximate 128 MiB initial target | Volume fixtures retained, real 2/8 exact comparison and event logs |
+| Business dedup hash | Native hash plus exact candidate fallback | Hash equality is insufficient; no UDF or all-row JSON fallback | Collision fixtures, old/new benchmark and full-day oracle |
+| Complete date publication | Same-filesystem generation rename plus atomic pointer | Retained generations and explicit recovery; no pipeline transaction | Bind faults, real process kills, gated consumers and recovery |
+| Optional schema/tests/SQL/CSV | Adopted with explicit grains and reconciliations | Additional maintenance; aggregated rejects are not lineage | 46 tests, eight-schema oracle, five-table/two-CSV checks |
 
-## Known limitations
+## Known limitations and operations
 
-GH Archive delivery latency, upstream completeness, changes to completed remote
-objects, and activity beyond selected hours have not been established. Bot
-classification is heuristic. The oracle supports the tested JSON contract;
-unsupported malformed shapes fail reconciliation rather than being silently
-certified. No production scheduler, CI, or native-host tests are claimed.
-Version-tag image selection can change upstream.
+Two historical Windows-bind `PermissionError: [Errno 13]` failures occurred while
+renaming a `daily_volume` generation in nested test harnesses. Their **cause
+remains indeterminate**. Three isolated public CLI repetitions (48 first
+publications) and one fresh nested-harness run passed, but do not resolve the
+original failures or prove absence. Failed trees/logs are preserved. No speculative
+retry, GC or storage patch was added; readers fail closed and explicit recovery
+is required. Path-length probes and later passes do not prove MAX_PATH or JVM/GC
+causation. This is an open operational risk on the tested bind.
+
+Crash evidence demonstrates process interruption on the tested filesystem;
+`fsync` requests do not establish host/VM power-loss durability. Hash/discovery
+I/O, retained-generation disk cost and single-writer constraints remain. No
+coordinated transaction covers pipeline or exports.
+
+GH Archive upstream completeness, receipt latency, changes to completed remote
+objects and activity beyond selected hours are not established. Unsupported
+malformed shapes are not silently certified by the oracle. Traceability, payload
+projection, bot heuristic, resource-allocation and platform limits above apply.
+Logs contain runtime/stage counts; acquisition/verifiers write selected reports.
+Keep exact commands, coverage and baselines when operating. No scheduler, CI,
+automatic retry, coordinated backup or retention automation is present.
+
+Exact local validation commands, failures/corrections, images/source hashes,
+schema reports, ADR matrix and draft submission are retained under ignored
+`data/test/integrated-validation/2026-10-02/`. These are evidence, not dependencies
+of a clean clone. The final candidate requires independent/human review and
+publication approval; checkpoint feedback is not a grade or final submission.
 
 ## Troubleshooting
 
 | Symptom | Verified cause or behavior | Remedy / action | Verification |
 | --- | --- | --- | --- |
-| Full-day oracle is very slow when SQLite scratch is on the Windows bind | Two scratch-on-bind attempts were intentionally stopped; random-I/O scratch was moved into the container | Use the current `stream_oracle.py`, which creates SQLite scratch under container `/tmp` and persists expected rows/reports under the requested `/data/test` destination | Scratch-backed oracle completed in 1216.833 s and all seven datasets matched; no OOM cause was established |
-| An older image prints `shuffle_partitions=2` despite launcher `--conf spark.sql.shuffle.partitions=8` | Historical session code overwrote the launcher setting; source is copied into images | The source defect is fixed. Rebuild with `docker compose build`, then run the reproducibility command above before the pipeline | Fresh-process assertion and complete real-day run observed effective 8; logical output matched the original 2 baseline |
+| Reader reports interrupted publication | Journal/residual staging causes fail-closed discovery, including after pointer replacement | Stop writer, inspect, explicitly recover the affected date, restart and reexport | Bind fault matrix and real SIGKILL recovery with other dates intact |
+| SQLite raw oracle stalls on a Windows bind | Two historical bind-scratch attempts were stopped; container random-I/O scratch completed | Use current `stream_oracle.py`, which keeps SQLite in `/tmp` and persists reports/expected rows on `/data` | Complete 24-hour oracle matched all eight datasets |
+| Old image reports shuffle 2 despite explicit 8 | Historical session code overrode launcher; source is copied into images | Rebuild; run `check_reproducibility.py` before relying on changed configuration | Fresh-process override and real native8 matched automatic 2 |
+| Small-sample profiler refuses input | Declared row/byte limit exceeded before materializing whole frames | Use `stream_oracle.py` and `validate_parquet.py` for full-day verification | Overflow tests and guarded native fixture profile passed |
 
 ## Credits and licence
 
-Own code and documentation are licensed under [MIT](LICENSE).
-The licence does **not** cover downloaded archives, generated event datasets,
-third-party content, or third-party runtime assets. GH Archive is the data source;
-its code licence does not establish MIT rights over all underlying GitHub events.
-No ownership of the event dataset is claimed.
+Own code and documentation use [MIT](LICENSE). This does not license downloaded
+archives, event datasets, third-party content or runtime assets. GH Archive's
+code licence does not establish MIT rights over underlying GitHub events; no
+ownership of that dataset is claimed.
 
 Exercise: [DataSkew](https://dataskew.io/projects/batch-processing-spark/).
 Data: [GH Archive](https://www.gharchive.org/).
 Runtime: [Apache Spark](https://spark.apache.org/) and [DuckDB](https://duckdb.org/),
-under their respective licences.
+under their respective licences. Resource/SQL behavior was checked against the
+[Spark 3.5.9 documentation](https://spark.apache.org/docs/3.5.9/).

@@ -3,6 +3,9 @@
 Run with spark-submit. The raw oracle uses Python's JSON and datetime parsers;
 it does not call the pipeline's transformations or aggregations. Reports and
 full-row multiset fingerprints are generated artifacts under the data mount.
+This in-memory sample tool enforces 200,000 rows and 128 MiB of uncompressed
+raw/serialized frame data. These limits are not a process-memory guarantee.
+For full days use stream_oracle.py and validate_parquet.py instead.
 """
 
 import argparse
@@ -11,12 +14,19 @@ from collections import Counter
 from datetime import date, datetime, timezone
 import gzip
 import hashlib
+import io
 import json
 from pathlib import Path
 
 from github_analytics.session import create_session
 from github_analytics.storage import read_date
 from github_analytics.publication import published_partition
+from scripts.acquire_archive import file_hash
+from pyspark.sql import functions as F
+
+MAX_SAMPLE_ROWS = 200_000
+MAX_SAMPLE_BYTES = 128 * 1024 ** 2
+SAMPLE_LIMIT_MESSAGE = "Sample limit exceeded; use stream_oracle.py and validate_parquet.py for full days"
 
 DATASETS = ("ingested", "clean", "rejected", "event_counts", "daily_volume",
             "top_repositories", "top_actors", "rejection_counts")
@@ -55,18 +65,42 @@ def normalized(event, source_uri, day):
             "event_date": str(day)}
 
 
-def raw_oracle(raw_root, day):
+class _SampleInput(io.RawIOBase):
+    """Bound original decompressed bytes before UTF-8/universal-newline decoding."""
+
+    def __init__(self, stream, budget, maximum):
+        self.stream, self.budget, self.maximum = stream, budget, maximum
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        chunk = self.stream.read(min(len(buffer), self.maximum - self.budget[0] + 1))
+        self.budget[0] += len(chunk)
+        if self.budget[0] > self.maximum:
+            raise ValueError(SAMPLE_LIMIT_MESSAGE)
+        buffer[:len(chunk)] = chunk
+        return len(chunk)
+
+
+def raw_oracle(raw_root, day, max_records=MAX_SAMPLE_ROWS, max_bytes=MAX_SAMPLE_BYTES):
+    if max_records < 1 or max_bytes < 1:
+        raise ValueError("Sample limits must be positive")
     inputs, expected, reasons, all_types = [], [], Counter(), Counter()
     ingested, timestamps, rejected_rows, candidates = [], [], [], {}
+    byte_budget = [0]
     for path in sorted(Path(raw_root).glob(f"{day}-*.json.gz")):
         source_uri = path.resolve().as_uri()
         inputs.append({"url": f"https://data.gharchive.org/{path.name}",
                        "filename": path.name, "compressed_bytes": path.stat().st_size,
-                       "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
-        with gzip.open(path, "rt", encoding="utf-8") as stream:
+                       "sha256": file_hash(path)})
+        with gzip.open(path, "rb") as raw, io.TextIOWrapper(
+                io.BufferedReader(_SampleInput(raw, byte_budget, max_bytes)), encoding="utf-8") as stream:
             for line in stream:
                 if not line.strip():
                     continue
+                if len(ingested) >= max_records:
+                    raise ValueError(SAMPLE_LIMIT_MESSAGE)
                 corrupt = None
                 try:
                     event = json.loads(line)
@@ -125,23 +159,40 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
 
 
-def profile(spark, raw_root, output_root, day, top_n):
-    inputs, raw_lines, expected, reasons, all_types, raw_ingested, timestamps, expected_rejected = raw_oracle(raw_root, day)
+def bounded_sample_frame(frame, max_records=MAX_SAMPLE_ROWS, max_bytes=MAX_SAMPLE_BYTES):
+    """Native scalar guards precede any driver-wide collection or cache."""
+    if frame.limit(max_records + 1).count() > max_records:
+        raise ValueError(SAMPLE_LIMIT_MESSAGE)
+    size = frame.select(F.length(F.encode(F.to_json(F.struct(*frame.columns)), "UTF-8")).alias("bytes"))
+    total = size.agg(F.coalesce(F.sum("bytes"), F.lit(0))).first()[0]
+    if total > max_bytes:
+        raise ValueError(SAMPLE_LIMIT_MESSAGE)
+    return frame
+
+
+def profile(spark, raw_root, output_root, day, top_n,
+            max_records=MAX_SAMPLE_ROWS, max_bytes=MAX_SAMPLE_BYTES):
+    inputs, raw_lines, expected, reasons, all_types, raw_ingested, timestamps, expected_rejected = raw_oracle(
+        raw_root, day, max_records, max_bytes)
     frames, datasets = {}, {}
-    for name in DATASETS:
-        root = Path(output_root) / name
-        partition = root / f"event_date={day}"
-        frame = read_date(spark, root, day).cache()
-        frames[name] = frame
-        assert {field.name: field.dataType.simpleString() for field in frame.schema} == SCHEMAS[name], (name, frame.schema)
-        serialized = sorted(frame.toJSON().collect())
-        datasets[name] = {"rows": len(serialized), "schema": frame.schema.simpleString(),
-                          "sha256_rows": hashlib.sha256("\n".join(serialized).encode()).hexdigest(),
-                          "partitions": sorted(p.name for p in root.glob("event_date=*")),
-                          "parquet_files": len(published_partition(root, day)[0])}
-        assert f"event_date={day}" in datasets[name]["partitions"], name
-        assert datasets[name]["parquet_files"] > 0, name
-        assert all(str(r.event_date) == str(day) for r in frame.select("event_date").distinct().collect()), name
+    try:
+        for name in DATASETS:
+            root = Path(output_root) / name
+            frame = bounded_sample_frame(read_date(spark, root, day), max_records, max_bytes).cache()
+            frames[name] = frame
+            assert {field.name: field.dataType.simpleString() for field in frame.schema} == SCHEMAS[name], (name, frame.schema)
+            serialized = sorted(frame.toJSON().collect())
+            datasets[name] = {"rows": len(serialized), "schema": frame.schema.simpleString(),
+                              "sha256_rows": hashlib.sha256("\n".join(serialized).encode()).hexdigest(),
+                              "partitions": sorted(p.name for p in root.glob("event_date=*")),
+                              "parquet_files": len(published_partition(root, day)[0])}
+            assert f"event_date={day}" in datasets[name]["partitions"], name
+            assert datasets[name]["parquet_files"] > 0, name
+            assert all(str(r.event_date) == str(day) for r in frame.select("event_date").distinct().collect()), name
+    except Exception:
+        for frame in frames.values():
+            frame.unpersist()
+        raise
     try:
         assert datasets["ingested"]["rows"] == raw_lines
         actual_ingested = [r.asDict(recursive=True) for r in frames["ingested"].collect()]
