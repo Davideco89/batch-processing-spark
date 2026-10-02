@@ -2,7 +2,7 @@
 # Bootstrap only Docker and autonomous fixtures; never download real archives.
 set -euo pipefail
 
-project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$project_root"
 fail() { printf 'Setup failed: %s\n' "$*" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || fail 'Docker is not installed or is not on PATH.'

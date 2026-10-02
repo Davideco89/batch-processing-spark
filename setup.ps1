@@ -1,6 +1,6 @@
 # Bootstrap only Docker and autonomous fixtures; never download real archives.
 $ErrorActionPreference = 'Stop'
-$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$ProjectRoot = $PSScriptRoot
 Push-Location $ProjectRoot
 try {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
