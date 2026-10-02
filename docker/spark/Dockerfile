@@ -1,4 +1,5 @@
-FROM spark:3.5.9-scala2.12-java17-python3-ubuntu
+# Preserve the exact runtime used for the validated pipeline and benchmarks.
+FROM spark:3.5.9-scala2.12-java17-python3-ubuntu@sha256:0fd2f57b122301c9fd02988ba8d7d68f03fa6f680ba092a9e6249c92610bd2ed
 
 USER root
 # Register the host identity instead of running Java with an unknown numeric UID.
@@ -29,5 +30,5 @@ COPY --chown=spark:spark jobs/ /app/jobs/
 COPY --chown=spark:spark tests/ /app/tests/
 COPY --chown=spark:spark scripts/ /app/scripts/
 
-ENTRYPOINT ["/opt/spark/bin/spark-submit", "--master", "local[2]"]
+ENTRYPOINT ["python3", "/app/scripts/launch_job.py"]
 CMD ["/app/jobs/pipeline.py", "--date", "2025-06-01"]

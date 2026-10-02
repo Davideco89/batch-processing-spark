@@ -9,6 +9,13 @@ services:
         LOCAL_GID: "${LOCAL_GID:-185}"
     volumes:
       - ./data:/data
+    environment:
+      - SPARK_MASTER
+      - SPARK_DRIVER_MEMORY
+      - SPARK_EXECUTOR_MEMORY
+      - SPARK_EXECUTOR_CORES
+      - SPARK_TOTAL_EXECUTOR_CORES
+      - SPARK_SHUFFLE_PARTITIONS
   test:
     user: "${LOCAL_UID:-185}:${LOCAL_GID:-185}"
     build:

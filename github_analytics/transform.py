@@ -19,14 +19,24 @@ def deduplicate_valid(frame):
     Invalid copies never enter this function and retain their quality reasons.
     """
     group = Window.partitionBy("event_date", "event_id")
-    signature = F.to_json(F.struct(*BUSINESS_FIELDS), {"ignoreNullFields": "false"})
-    tagged = frame.withColumn("_business", signature)
-    tagged = (tagged.withColumn("_conflict", F.min("_business").over(group) != F.max("_business").over(group))
+    business = F.struct(*BUSINESS_FIELDS)
+    tagged = frame.withColumn("_hash", F.xxhash64(business))
+    tagged = (tagged.withColumn("_copies", F.count(F.lit(1)).over(group))
+              .withColumn("_hash_min", F.min("_hash").over(group))
+              .withColumn("_hash_max", F.max("_hash").over(group)))
+    # Hash inequality proves a conflict. Equality never proves business equality:
+    # serialize only the duplicate candidate groups requiring an exact check.
+    candidates = (F.col("_copies") > 1) & (F.col("_hash_min") == F.col("_hash_max"))
+    tagged = tagged.withColumn("_business", F.when(
+        candidates, F.to_json(business, {"ignoreNullFields": "false"})))
+    conflict = ((F.col("_hash_min") != F.col("_hash_max")) |
+                (F.min("_business").over(group) != F.max("_business").over(group)))
+    tagged = (tagged.withColumn("_conflict", F.coalesce(conflict, F.lit(False)))
               .withColumn("_copy", F.row_number().over(group.orderBy(F.col("source_file").asc_nulls_last()))))
     return (tagged.withColumn("rejection_reason",
                              F.when(F.col("_conflict"), "conflicting_event_id")
                               .when(F.col("_copy") > 1, "duplicate_event_id"))
-            .drop("_business", "_conflict", "_copy"))
+            .drop("_hash", "_copies", "_hash_min", "_hash_max", "_business", "_conflict", "_copy"))
 
 
 def transform(frame, event_date):

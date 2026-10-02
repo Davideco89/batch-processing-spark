@@ -23,7 +23,8 @@ class PathTests(TestCase):
                                      (["--raw-root", "/tmp/raw", "--output-root", "/tmp/parquet"], "/tmp/raw", "/tmp/parquet")):
             with self.subTest(options=options), patch("sys.argv", ["pipeline", "--date", "2025-06-01", *options]), patch.object(runner, "create_session") as session, patch.object(runner, "run_stage") as run:
                 runner.main("pipeline")
-                run.assert_called_once_with(session.return_value, "pipeline", date(2025, 6, 1), raw, output, 10)
+                run.assert_called_once_with(session.return_value, "pipeline", date(2025, 6, 1), raw, output, 10,
+                                            from_stage="ingest", shuffle_partitions=None, target_bytes=134217728)
 
     def test_export_defaults_and_modes_with_explicit_overrides(self):
         cases = [([], PARQUET_ROOT, CSV_ROOT, DATABASE),
